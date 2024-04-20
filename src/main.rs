@@ -1,11 +1,16 @@
-use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, sync::atomic::AtomicUsize};
+use std::{
+    fmt::Debug, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::atomic::AtomicUsize
+};
 
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
 
-use tokio::{net::UdpSocket, time::{Interval, Instant, Duration}};
+use tokio::{    
+    net::UdpSocket,
+    time::{Duration, Instant, Interval},
+};
 
 use tokio_util::udp::UdpFramed;
 // use tun_tap::{Iface, Mode};
@@ -36,11 +41,13 @@ struct Args {
 //use tracing::{span, Level};
 use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
-use chacha20::ChaCha20;
-use tracing::{info,debug};
+
+use tracing::{debug, info};
 // Import relevant traits
-use chacha20::cipher::{KeyIvInit, StreamCipher};
+
 //use hex_literal::hex;
+mod crypto;
+use crypto::crypto_worker;
 
 async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     match handle.await {
@@ -50,65 +57,115 @@ async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     }
 }
 #[derive(Default, Debug)]
-struct Counters{
+struct Counters {
     pkt: AtomicUsize,
     bytes: AtomicUsize,
 }
 
-impl std::fmt::Display for Counters{
+impl std::fmt::Display for Counters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f,"Packets: {:#?}, Bytes: {:#?}", self.pkt, self.bytes)
+        write!(f, "Packets: {:#?}, Bytes: {:#?}", self.pkt, self.bytes)
+    }
+}
+mod unit_fmt {
+    use si_scale::scale_fn;    
+    pub use si_scale::helpers::bytes;
+    // defines the `bits_per_sec()` function
+    scale_fn!(bits_per_sec,
+              base: B1000,
+              constraint: UnitAndAbove,
+              mantissa_fmt: "{:.3}",
+              groupings: '_',
+              unit: "bit/s",
+              doc: "Return a string with the value and its si-scaled unit of bit/s.");
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            pkt: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn pkt(&self, size: usize) {
+        self.pkt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn prep_display(&self, elapsed: Duration) -> impl std::fmt::Display {
+        struct CountersDispl {
+            d: Duration,
+            pkt: usize,
+            bytes: usize,
+        }
+
+        impl std::fmt::Display for CountersDispl {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                
+                let t =self.d.as_secs_f32();                 
+                
+                write!(f, "Packets: {:#?} ({:#?}/s), Data: {} ({})", self.pkt,self.pkt as f32/t , unit_fmt::bytes(self.bytes as f64), unit_fmt::bits_per_sec(self.bytes as f32 *8.0 / t))
+            }
+        }
+
+        let pkt = self.pkt.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        CountersDispl{d:elapsed, pkt:pkt, bytes:bytes}        
     }
 }
 
 #[derive(Debug)]
-struct CountersAll{
-   tap_tx:Counters,
-   tap_rx:Counters,
-   udp_rx: Counters,
-   udp_tx:Counters,
+struct CountersAll {
+    tap_tx: Counters,
+    tap_rx: Counters,
+    udp_rx: Counters,
+    udp_tx: Counters,
 }
 
-impl Counters{      
-    const fn new()  ->Self{
-        Self{pkt:AtomicUsize::new(0), bytes:AtomicUsize::new(0)}
+
+
+pub trait Wtf: tokio::io::AsyncWriteExt + Unpin {}
+impl<T> Wtf for T where T: tokio::io::AsyncWriteExt + Unpin {}
+impl CountersAll {
+    const fn new() -> Self {
+        Self {
+            udp_tx: Counters::new(),
+            tap_tx: Counters::new(),
+            tap_rx: Counters::new(),
+            udp_rx: Counters::new(),
+        }
     }
-    
-    fn pkt(&self, size:usize){
-        self.pkt.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-        self.bytes.fetch_add(size,std::sync::atomic::Ordering::Relaxed);
+    async fn write_as_text(&self, elapsed: tokio::time::Duration, f: &mut impl Wtf) -> Result<()> {
+        
+        let s = format!(r"Uptime {elapsed:#?}
+UDP TX {}
+UDP RX {}
+TAP TX {}
+TAP RX {}
+", self.udp_tx.prep_display(elapsed), self.udp_rx.prep_display(elapsed), self.tap_tx.prep_display(elapsed), self.tap_rx.prep_display(elapsed));            
+        f.write_all(s.as_bytes()).await?;
+
+        Ok(())
+    }
+}
+async fn watch_counters(mut interval: Interval) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        interval.tick().await;
+        let mut so = tokio::io::stdout();
+        COUNTERS.write_as_text(start.elapsed(), &mut so).await?;
     }
 }
 
-impl std::fmt::Display for CountersAll{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f,"UDP TX {}", self.udp_tx)?;
-        writeln!(f,"UDP RX {}", self.udp_rx)?;
-        writeln!(f,"TAP TX {}", self.tap_tx)?;
-        writeln!(f,"TAP RX {}", self.tap_rx)
-    }
-}
-
-impl CountersAll{
-    const fn new()  ->Self{
-        Self{udp_tx:Counters::new(), tap_tx: Counters::new(), tap_rx: Counters::new(), udp_rx: Counters::new() }
-    }
-}
-async fn watch_counters(mut interval:Interval)->Result<()>{
-    loop{    
-      interval.tick().await;
-      println!("{}", &COUNTERS);
-    }    
-}
-
-static COUNTERS:CountersAll = CountersAll::new();
+static COUNTERS: CountersAll = CountersAll::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
     debug!("Arguments are {:?}", &args);
-    
+
     let socket = UdpSocket::bind(&args.local_address).await?;
 
     info!("UDP bind successful");
@@ -128,13 +185,17 @@ async fn main() -> Result<()> {
             .try_build() // or `.try_build_mq(queues)` for multi-queue support.
             .expect("Could not register TAP interface, are you root?"),
     );
-    
+
     info!("TAP created, name: {}", tun.name());
 
     let key = Arc::new([0x42; 32]);
-    
+
     // Key and IV must be references to the `GenericArray` type.
-    let interval =  tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_millis(1000));
+    let interval = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_millis(1000),
+    );
+
     let watch_counters = flatten(tokio::spawn(watch_counters(interval)));
     let mut crypto_workers = (0..2).map(|e| {
         let input_chan = tokio::sync::mpsc::channel(64);
@@ -159,62 +220,47 @@ async fn main() -> Result<()> {
     // TAP Reader
     let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.0)));
     let tap_writer = flatten(tokio::spawn(feed_tap(decryptor.1, tun.clone())));
-    // tokio::select!{
-    //     r=udp_reader=>{r?},
-    //     r=udp_writer=>{r?},
-    //     r=tap_reader=>{r?},
-    //     r=tap_writer=>{r?},
-    // }?;
 
-    tokio::try_join!(udp_reader, udp_writer, tap_reader, tap_writer, watch_counters)?;
+    tokio::try_join!(
+        udp_reader,
+        udp_writer,
+        tap_reader,
+        tap_writer,
+        watch_counters
+    )?;
 
     Ok(())
 }
 
-#[instrument]
-fn crypto_worker(
-    key: Arc<[u8; 32]>,
-    mut input: tokio::sync::mpsc::Receiver<BytesMut>,
-    output: tokio::sync::mpsc::Sender<BytesMut>,
-) {
+fn read_tap_blocking() -> Result<()> {
     loop {
-        let mut b = match input.blocking_recv() {
-            None => break,
-            Some(b) => b,
-        };
-        //dbg!("Encrypting buffer with {} bytes", b.len());
-        //Todo fetch nonce from packet body
-        let nonce = [0x24; 12];
-        let mut cipher = ChaCha20::new(key.as_ref().into(), &nonce.into());
-        cipher.apply_keystream(b.as_mut());
-        match output.blocking_send(b) {
-            Ok(_) => {}
-            Err(e) => {
-                dbg!(&e);
-                println!("{}", &e.to_string());
-                //panic!("WAAA");
-                return;
-            }
-        }
+        std::thread::sleep(Duration::from_nanos(10));
     }
+    Ok(())
 }
 
 #[instrument(skip(tun))]
 async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<BytesMut>) -> Result<()> {
+    //let mut interval = tokio::time::interval(Duration::from_nanos(10));
     loop {
+        let mut buf = BytesMut::with_capacity(1800);
         //TODO: deal with excessive malloc's here
-        let mut buf = BytesMut::with_capacity(2048);
+
         //assume buf is initialized, not like we trust incoming data anywau
         unsafe {
             buf.set_len(buf.capacity());
         }
 
-        let n = tun.recv(&mut buf).await?;
+        let n = match cfg!(feature = "bench_tap_rx") {
+            true => 1500,
+            false => tun.recv(&mut buf).await?,
+        };
+
         COUNTERS.tap_rx.pkt(n);
-        let buf = buf.split_to(n);
-        //let mut rg=tun.readable().await?;
-        //let res = rg.try_io(|inner|{read_raw_fd(inner.get_ref(),&mut buf)});
-        //dbg!(res);
+
+        unsafe {
+            buf.set_len(n);
+        }
         //println!("reading {} bytes: {:?}", n, &buf[..n]);
         output.send(buf).await?;
     }
@@ -235,10 +281,12 @@ async fn feed_udp(
         };
         COUNTERS.udp_tx.pkt(b.len());
         //println!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
-        // match udp.feed((Bytes::from(b), peer)).await {
-        //     Ok(_) => {}
-        //     Err(e) =>{/* return Err(eyre!("UDP send error {}", e))*/},
-        // }
+        if cfg!(not(feature = "bench_tap_rx")) {
+            match udp.feed((Bytes::from(b), peer)).await {
+                Ok(_) => {}
+                Err(e) => return Err(eyre!("UDP send error {}", e)),
+            }
+        }
     }
 }
 
@@ -248,13 +296,20 @@ async fn read_udp(
     output: tokio::sync::mpsc::Sender<BytesMut>,
 ) -> Result<()> {
     loop {
-        let (pkt, peer) = match udp.next().await {
-            Some(p) => p?,
-            None => {
-                return Err(eyre!("UDP Peer Disconnected"));
-            } //
+        let (pkt, _peer) = match cfg!(feature = "bench_udp_rx") {
+            true => (
+                BytesMut::zeroed(1500),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            ),
+            false => match udp.next().await {
+                Some(p) => p?,
+                None => {
+                    return Err(eyre!("UDP Peer Disconnected"));
+                } //
+            },
         };
-COUNTERS.udp_rx.pkt(pkt.len());
+
+        COUNTERS.udp_rx.pkt(pkt.len());
         //dbg!("Receiverd  {} bytes from UDP peer {}", pkt.len(), peer);
         output.send(pkt).await?;
     }

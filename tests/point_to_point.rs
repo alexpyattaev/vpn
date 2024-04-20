@@ -1,87 +1,89 @@
-use std::process::{Command, Output};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use itertools::Itertools;
+use std::process::{Command, Output};
 
-fn ip(args:&str)->Command{
+fn ip(args: &str) -> Command {
     let mut c = Command::new("ip");
     c.args(args.split(" "));
     c
 }
-fn print_command(c:&Command){
-    let args:String = c.get_args().map(|e|e.to_str().unwrap()).join(" ");
+fn print_command(c: &Command) {
+    let args: String = c.get_args().map(|e| e.to_str().unwrap()).join(" ");
     println!("Running {} {}", c.get_program().to_str().unwrap(), args)
-        
 }
 
-trait Entity: Drop{
-    fn teardown(&mut self)->Result<Output>;
-    fn set_up(&mut self)->Result<Output>;    
+trait Entity: Drop {
+    fn teardown(&mut self) -> Result<Output>;
+    fn set_up(&mut self) -> Result<Output>;
 }
 
-impl Drop for NS{
+impl Drop for NS {
     fn drop(&mut self) {
         let _ = self.teardown();
     }
 }
 
 #[derive(Debug)]
-struct NS{
-    name:String,    
+struct NS {
+    name: String,
 }
 
-
-impl Entity for NS{    
-    fn teardown(&mut self)->Result<Output> {
-        let mut c = ip(&format!("netns del {}",self.name));
+impl Entity for NS {
+    fn teardown(&mut self) -> Result<Output> {
+        let mut c = ip(&format!("netns del {}", self.name));
         print_command(&c);
         Ok(c.output()?)
     }
 
-    fn set_up(&mut self)->Result<Output> {
-        let mut c = ip(&format!("netns add {}",self.name));
+    fn set_up(&mut self) -> Result<Output> {
+        let mut c = ip(&format!("netns add {}", self.name));
         print_command(&c);
         Ok(c.output()?)
     }
 }
 
 #[derive(Debug)]
-struct Bridge{
-    name:String,    
+struct Bridge {
+    name: String,
 }
-impl Drop for Bridge{
+impl Drop for Bridge {
     fn drop(&mut self) {
         let _ = self.teardown();
     }
 }
 
-impl Entity for Bridge{    
-    
-    fn set_up(&mut self)->Result<Output> {
-        let mut c = ip(&format!("link add name {} type bridge",self.name));
-        print_command(&c);
-        Ok(c.output()?)
-    }
-    
-    fn teardown(&mut self)->Result<Output> {
-        let mut c = ip(&format!("link del {}",self.name));
+impl Entity for Bridge {
+    fn set_up(&mut self) -> Result<Output> {
+        let mut c = ip(&format!("link add name {} type bridge", self.name));
         print_command(&c);
         Ok(c.output()?)
     }
 
+    fn teardown(&mut self) -> Result<Output> {
+        let mut c = ip(&format!("link del {}", self.name));
+        print_command(&c);
+        Ok(c.output()?)
+    }
 }
 
 //ip l add name br0 type bridge
 
 #[test]
-fn main()->Result<()>{
-    let mut  ns_a = NS{name:"A".to_owned()};
-    let mut ns_b = NS{name:"B".to_owned()};
-    let mut br_mon = Bridge{name:"monitor".to_owned()};
+fn main() -> Result<()> {
+    let mut ns_a = NS {
+        name: "A".to_owned(),
+    };
+    let mut ns_b = NS {
+        name: "B".to_owned(),
+    };
+    let mut br_mon = Bridge {
+        name: "monitor".to_owned(),
+    };
     ns_a.set_up()?;
     ns_b.set_up()?;
     br_mon.set_up()?;
-    
+
     let mut buf = String::new();
     std::io::stdin().read_line(&mut buf)?;
     println!("You typed {}", buf);
@@ -89,11 +91,11 @@ fn main()->Result<()>{
 }
 
 // fn cleanup(){
-    
+
 // let cmds = r"ip link del veth_A
 // ip link del veth_B
 // ip netns del A
-// ip netns del B";    
+// ip netns del B";
 // }
 
 /*
