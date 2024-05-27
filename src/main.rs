@@ -1,5 +1,7 @@
 use std::{
-    fmt::Debug, net::{IpAddr, Ipv4Addr, SocketAddr}, sync::atomic::AtomicUsize
+    fmt::Debug,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::atomic::AtomicUsize,
 };
 
 use futures::{
@@ -7,7 +9,7 @@ use futures::{
     SinkExt, StreamExt,
 };
 
-use tokio::{    
+use tokio::{
     net::UdpSocket,
     time::{Duration, Instant, Interval},
 };
@@ -40,11 +42,12 @@ struct Args {
 
 mod framing;
 use framing::*;
-pub async fn receive_pipeline_pseudocode()->Result<()>{
-    let buf = BytesMut::new();// packet with stuff from UDP
+
+pub async fn receive_pipeline_pseudocode() -> Result<()> {
+    let buf = BytesMut::new(); // packet with stuff from UDP
     let parsed = UntrustedMessage::from_buffer(buf)?;
-    crypto::apply_decryption([42;32], parsed.header.seq, parsed.body);
-    
+    crypto::apply_decryption([42; 32], parsed.header.seq, parsed.body);
+
     Ok(())
 }
 
@@ -78,8 +81,8 @@ impl std::fmt::Display for Counters {
     }
 }
 mod unit_fmt {
-    use si_scale::scale_fn;    
     pub use si_scale::helpers::bytes;
+    use si_scale::scale_fn;
     // defines the `bits_per_sec()` function
     scale_fn!(bits_per_sec,
               base: B1000,
@@ -112,16 +115,26 @@ impl Counters {
 
         impl std::fmt::Display for CountersDispl {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                
-                let t =self.d.as_secs_f32();                 
-                
-                write!(f, "Packets: {:#?} ({:#?}/s), Data: {} ({})", self.pkt,self.pkt as f32/t , unit_fmt::bytes(self.bytes as f64), unit_fmt::bits_per_sec(self.bytes as f32 *8.0 / t))
+                let t = self.d.as_secs_f32();
+
+                write!(
+                    f,
+                    "Packets: {:#?} ({:#?}/s), Data: {} ({})",
+                    self.pkt,
+                    self.pkt as f32 / t,
+                    unit_fmt::bytes(self.bytes as f64),
+                    unit_fmt::bits_per_sec(self.bytes as f32 * 8.0 / t)
+                )
             }
         }
 
         let pkt = self.pkt.load(std::sync::atomic::Ordering::Relaxed);
         let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
-        CountersDispl{d:elapsed, pkt:pkt, bytes:bytes}        
+        CountersDispl {
+            d: elapsed,
+            pkt: pkt,
+            bytes: bytes,
+        }
     }
 }
 
@@ -132,8 +145,6 @@ struct CountersAll {
     udp_rx: Counters,
     udp_tx: Counters,
 }
-
-
 
 pub trait Wtf: tokio::io::AsyncWriteExt + Unpin {}
 impl<T> Wtf for T where T: tokio::io::AsyncWriteExt + Unpin {}
@@ -147,13 +158,18 @@ impl CountersAll {
         }
     }
     async fn write_as_text(&self, elapsed: tokio::time::Duration, f: &mut impl Wtf) -> Result<()> {
-        
-        let s = format!(r"Uptime {elapsed:#?}
+        let s = format!(
+            r"Uptime {elapsed:#?}
 UDP TX {}
 UDP RX {}
 TAP TX {}
 TAP RX {}
-", self.udp_tx.prep_display(elapsed), self.udp_rx.prep_display(elapsed), self.tap_tx.prep_display(elapsed), self.tap_rx.prep_display(elapsed));            
+",
+            self.udp_tx.prep_display(elapsed),
+            self.udp_rx.prep_display(elapsed),
+            self.tap_tx.prep_display(elapsed),
+            self.tap_rx.prep_display(elapsed)
+        );
         f.write_all(s.as_bytes()).await?;
 
         Ok(())
@@ -181,7 +197,7 @@ async fn main() -> Result<()> {
     info!("UDP bind successful");
     socket.connect(args.remote_address).await?;
     info!("UDP connect successful");
-    
+
     let codec = LengthDelimitedCodec::new();
     let framed_socket = UdpFramed::new(socket, codec);
 

@@ -15,6 +15,7 @@ futures = "0.3.30"
 itertools = "0.12.1"
 serde = { version = "1.0.198", features = ["derive"] }
 si-scale = "0.2.2"
+sorted-vec = "0.8.3"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-tun = "0.11.4"
 tokio-util = { version = "0.7.10", features = ["full"] }
