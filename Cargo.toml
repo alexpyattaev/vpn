@@ -6,12 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bincode = "2.0.0-rc.3"
 bytes = "1.6.0"
 chacha20 = "0.9.1"
 clap = { version = "4.5.4", features = ["derive"] }
 color-eyre = "0.6.3"
 futures = "0.3.30"
 itertools = "0.12.1"
+serde = { version = "1.0.198", features = ["derive"] }
 si-scale = "0.2.2"
 tokio = { version = "1.37.0", features = ["full"] }
 tokio-tun = "0.11.4"

@@ -38,6 +38,16 @@ struct Args {
     remote_address: SocketAddr,
 }
 
+mod framing;
+use framing::*;
+pub async fn receive_pipeline_pseudocode()->Result<()>{
+    let buf = BytesMut::new();// packet with stuff from UDP
+    let parsed = UntrustedMessage::from_buffer(buf)?;
+    crypto::apply_decryption([42;32], parsed.header.seq, parsed.body);
+    
+    Ok(())
+}
+
 //use tracing::{span, Level};
 use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
@@ -171,6 +181,7 @@ async fn main() -> Result<()> {
     info!("UDP bind successful");
     socket.connect(args.remote_address).await?;
     info!("UDP connect successful");
+    
     let codec = LengthDelimitedCodec::new();
     let framed_socket = UdpFramed::new(socket, codec);
 
