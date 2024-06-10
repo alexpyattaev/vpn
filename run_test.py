@@ -11,9 +11,8 @@ def run_cmd(args:str):
 
 
 
-def add_tap_ifaces():
-    run_cmd('ip tuntap add mode tap tap0')
-    run_cmd('ip tuntap add mode tap tap1')
+
+
 
 def add_vpn_interface(namespaces, interfaces):
     for x in range(2):
@@ -41,12 +40,12 @@ def  CleanAll(NS1, NS2):
 
 
 def CreateNameSpaces(namespaces):
-    subprocess.run(f'ip link add veth1 type veth peer name veth2', shell=True, text=True)
+    run_cmd(f'ip link add veth1 type veth peer name veth2')
     for NS in namespaces:
-        subprocess.run(f'ip netns add  {NS}', shell=True, text=True)
-        subprocess.run(f'ip link set veth{NS[-1]} netns {NS}', shell=True, text=True)
-        subprocess.run(f'ip -n {NS} a a 1.1.1.{NS[-1]}/24 dev veth{NS[-1]}', shell=True, text=True)
-        subprocess.run(f'ip -n {NS} l set veth{NS[-1]} up', shell=True, text=True)
+        run_cmd(f'ip netns add  {NS}')
+        run_cmd(f'ip link set veth{NS[-1]} netns {NS}')
+        run_cmd(f'ip -n {NS} a a 1.1.1.{NS[-1]}/24 dev veth{NS[-1]}')
+        run_cmd(f'ip -n {NS} l set veth{NS[-1]} up')
     res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
 
 
@@ -58,17 +57,20 @@ def main():
     if subprocess.run('whoami',shell=True, text=True, capture_output=True).stdout.find('root'):
         print(subprocess.run('whoami',shell=True, text=True, capture_output=True).stdout)
         exit("Should run as root user, restart ")
-    add_tap_ifaces()
+    NS1 = 's1'
+    NS2 = 's2'
     vpn1 = 'tap0'
     vpn2 = 'tap1'
-    NS1 = 's1'
+
+    for n in [vpn1, vpn2]:
+        run_cmd(f'ip tuntap add mode tap {n}')
+
     interface1 = [vpn1, '12.23.34.45']
-    NS2 = 's2'
     interface2 = [vpn2, '23.34.45.56']
     interfaces = [interface1, interface2]
     namespaces = [NS1,NS2]
-    CreateNameSpaces(namespaces)
 
+    CreateNameSpaces(namespaces)
 
 
     #add_bridges(namespaces)

@@ -1,11 +1,9 @@
-use std::io::Write;
-
+use crate::counters::COUNTERS;
 use bincode::config::{BigEndian, Configuration, Fixint, Limit};
 use bincode::{Decode, Encode};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use tokio::io::copy_buf;
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum MsgKind {
@@ -27,7 +25,7 @@ pub struct OuterHeader {
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub struct InnerHeader {
-    /// Message type selector           
+    /// Message type selector
     pub msgkind: MsgKind,
 }
 
@@ -53,8 +51,68 @@ pub struct TrustedMessage {
     pub body: BytesMut,
 }
 
+pub struct PacketFragmenter {
+    // current remaining packet data
+    raw_packet_data: BytesMut,
+    // how many bytes precede this fragment's start in the packet
+    frag_backptr: usize,
+    // MTU for fragmentation
+    mtu: usize,
+}
+
+impl PacketFragmenter {
+    pub fn new(pkt: BytesMut, mtu: usize) -> Self {
+        Self {
+            raw_packet_data: pkt,
+            mtu,
+            frag_backptr: 0,
+        }
+    }
+
+    fn next_fragment_len(&self) -> usize {
+        if self.raw_packet_data.len() > self.mtu {
+            return self.mtu;
+        }
+        return self.raw_packet_data.len();
+    }
+}
+
+impl Iterator for PacketFragmenter {
+    type Item = TrustedMessage;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next_len = self.next_fragment_len();
+        if next_len == 0 {
+            return None;
+        }
+
+        let msgkind = match self.frag_backptr {
+            // first fragment, indicate full length of the entire packet
+            0 => MsgKind::FirstFragment(self.raw_packet_data.len() as u16),
+            //other fragments, indicate the backoffset to the beginning of the packet
+            _ => {
+                COUNTERS.fragments_tx.pkt(next_len);
+                MsgKind::Fragment(self.frag_backptr as u16)
+            }
+        };
+        self.frag_backptr += next_len;
+
+        let msg = TrustedMessage {
+            outer_header: OuterHeader { seq: 0 },
+            inner_header: InnerHeader { msgkind },
+            body: self.raw_packet_data.split_to(next_len),
+        };
+        Some(msg)
+    }
+}
+
 impl TrustedMessage {
-    pub fn from_decrypted_msg(mut msg: UntrustedMessage) -> Result<Self> {
+    pub fn from_untrusted_msg<F>(mut msg: UntrustedMessage, decrypt: F) -> Result<Self>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        decrypt(&mut msg.body);
+
         let config = BinCodeConfig::default();
 
         let (inner_header, len): (InnerHeader, usize) =
@@ -80,8 +138,12 @@ impl TrustedMessage {
         let end = body_start + self.body.len();
         buf[body_start..end].copy_from_slice(&self.body);
         encrypt(&mut buf[inner_header_start..end]);
-        buf.split_off(end);
+        buf.truncate(end);
         Ok(buf.freeze())
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.body.len() + 64
     }
 }
 
@@ -118,6 +180,7 @@ impl Pipeline {
                 self.fragments.push(Fragment::from(m));
             }
             MsgKind::Fragment(o) => {
+                COUNTERS.fragments_rx.pkt(m.body.len());
                 if self.fragments.is_empty() {
                     self.seq_first = m.outer_header.seq;
                 } else if self.seq_first != (m.outer_header.seq - o as u64) {
