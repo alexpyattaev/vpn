@@ -2,27 +2,36 @@
 
 from performance_test import *
 import sys
+from time import sleep
+import subprocess
+
+
+def run_cmd(args:str):
+    print(f"# {args}")
+    return subprocess.run(args, shell=True, text=True)
+
 
 
 def add_dummy_ifaces():
-    subprocess.run('ip l a if1 type dummy', shell=True, text=True)
-    subprocess.run('ip l a if2 type dummy', shell=True, text=True)
+    run_cmd('ip l a if1 type dummy')
+    run_cmd('ip l a if2 type dummy')
+
 def add_vpn_interface(namespaces, interfaces):
     for x in range(2):
-        subprocess.run(f"ip l set {interfaces[x][0]} netns {namespaces[x]}",shell=True, text=True)
-        subprocess.run(f"ip -n {namespaces[x]} a a {interfaces[x][-1]}/24 dev {interfaces[x][0]}",shell=True, text=True)
-        subprocess.run(f"ip -n {namespaces[x]} l set {interfaces[x][0]} up ", shell=True, text=True)
+        run_cmd(f"ip l set {interfaces[x][0]} netns {namespaces[x]}")
+        run_cmd(f"ip -n {namespaces[x]} a a {interfaces[x][-1]}/24 dev {interfaces[x][0]}")
+        run_cmd(f"ip -n {namespaces[x]} l set {interfaces[x][0]} up ")
         addr = interfaces[x][-1]
         subnet = addr.split('.')[:-1]
         subnet = '.'.join(subnet) + '.0'
-        subprocess.run(f"ip -n {namespaces[x]} r d {subnet}/24", shell=True, text=True)
-    subprocess.run("ip -n s1 r a default via 1.1.1.2 dev veth1", shell=True, text=True)
-    subprocess.run("ip -n s2 r a default via 1.1.1.1 dev veth2", shell=True, text=True)
+        run_cmd(f"ip -n {namespaces[x]} r d {subnet}/24")
+    run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
+    run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
 
 def add_bridges(namespaces):
     for NS in namespaces:
-        subprocess.run(f'ip netns exec {NS} ip l a br0 type bridge ', shell=True, text=True)
-        subprocess.run(f'ip netns exec {NS} ip l set br0 up', shell=True, text=True)
+        run_cmd(f'ip netns exec {NS} ip l a br0 type bridge ')
+        run_cmd(f'ip netns exec {NS} ip l set br0 up')
 
 def  CleanAll(NS1, NS2):
     subprocess.run(f'ip netns d  {NS1}', shell=True, text=True)
@@ -68,6 +77,7 @@ def main():
     #add_bridges(namespaces)
     add_vpn_interface(namespaces, interfaces)
     server, running_server=server_run(NS1, interface1[1])
+    sleep(0.1)
     if running_server:
         client = client_run(NS2, interfaces)
         client.wait()

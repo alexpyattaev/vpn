@@ -1,9 +1,11 @@
+use std::io::Write;
+
 use bincode::config::{BigEndian, Configuration, Fixint, Limit};
 use bincode::{Decode, Encode};
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use sorted_vec::SortedVec;
+use tokio::io::copy_buf;
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum MsgKind {
@@ -66,6 +68,21 @@ impl TrustedMessage {
             body,
         })
     }
+    ///Serialize all headers and form a completed payload for UDP transmission
+    pub fn serialize<F>(self, mut buf: BytesMut, encrypt: F) -> Result<Bytes>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let config = BinCodeConfig::default();
+        let inner_header_start = bincode::encode_into_slice(self.outer_header, &mut buf, config)?;
+        let body_start =
+            inner_header_start + bincode::encode_into_slice(self.inner_header, &mut buf, config)?;
+        let end = body_start + self.body.len();
+        buf[body_start..end].copy_from_slice(&self.body);
+        encrypt(&mut buf[inner_header_start..end]);
+        buf.split_off(end);
+        Ok(buf.freeze())
+    }
 }
 
 type BinCodeConfig = Configuration<BigEndian, Fixint, Limit<128>>;
@@ -113,7 +130,9 @@ impl Pipeline {
         if self.is_complete() {
             let mut x = sorted_vec::SortedSet::new();
             std::mem::swap(&mut self.fragments, &mut x);
-            Ok(Some(x.into_vec()))
+            let res = Some(x.into_vec());
+            self.clear();
+            Ok(res)
         } else {
             Ok(None)
         }

@@ -1,3 +1,8 @@
+mod crypto;
+mod framing;
+use crypto::crypto_worker;
+use framing::*;
+
 use std::{
     fmt::Debug,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -38,10 +43,11 @@ struct Args {
     /// Number of times to greet
     #[arg(short, long)]
     remote_address: SocketAddr,
-}
 
-mod framing;
-use framing::*;
+    /// The Maximum Transfer Unit to use for the UDP side of the VPN
+    #[arg(short, long, default_value_t = 1500)]
+    udp_mtu: usize,
+}
 
 pub async fn receive_pipeline_pseudocode() -> Result<()> {
     let buf = BytesMut::new(); // packet with stuff from UDP
@@ -59,8 +65,6 @@ use tracing::{debug, info};
 // Import relevant traits
 
 //use hex_literal::hex;
-mod crypto;
-use crypto::crypto_worker;
 
 async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     match handle.await {
@@ -138,12 +142,15 @@ impl Counters {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct CountersAll {
     tap_tx: Counters,
     tap_rx: Counters,
     udp_rx: Counters,
     udp_tx: Counters,
+
+    udp_invalid: Counters,
+    tap_invalid: Counters,
 }
 
 pub trait Wtf: tokio::io::AsyncWriteExt + Unpin {}
@@ -155,6 +162,8 @@ impl CountersAll {
             tap_tx: Counters::new(),
             tap_rx: Counters::new(),
             udp_rx: Counters::new(),
+            udp_invalid: Counters::new(),
+            tap_invalid: Counters::new(),
         }
     }
     async fn write_as_text(&self, elapsed: tokio::time::Duration, f: &mut impl Wtf) -> Result<()> {
@@ -198,10 +207,10 @@ async fn main() -> Result<()> {
     socket.connect(args.remote_address).await?;
     info!("UDP connect successful");
 
-    let codec = LengthDelimitedCodec::new();
-    let framed_socket = UdpFramed::new(socket, codec);
+    //let codec = LengthDelimitedCodec::new();
+    //let framed_socket = UdpFramed::new(socket, codec);
 
-    let (sender, receiver) = framed_socket.split();
+    let socket = Arc::new(socket);
     debug!("Setting up TAP interface");
     let tun = Arc::new(
         Tun::builder()
@@ -215,7 +224,10 @@ async fn main() -> Result<()> {
 
     info!("TAP created, name: {}", tun.name());
 
-    let key = Arc::new([0x42; 32]);
+    let chachaparams = Arc::new(crypto::ChaChaParams {
+        key: [0x42; 32],
+        nonce: [0x42; 12],
+    });
 
     // Key and IV must be references to the `GenericArray` type.
     let interval = tokio::time::interval_at(
@@ -238,10 +250,14 @@ async fn main() -> Result<()> {
     let decryptor = crypto_workers.next().unwrap();
     info!("Crypto thread setup complete");
 
-    let udp_reader = flatten(tokio::spawn(read_udp(receiver, decryptor.0)));
+    let udp_reader = flatten(tokio::spawn(read_udp(
+        socket.clone(),
+        decryptor.0,
+        args.udp_mtu,
+    )));
     let udp_writer = flatten(tokio::spawn(feed_udp(
         encryptor.1,
-        sender,
+        socket.clone(),
         args.remote_address.clone(),
     )));
     // TAP Reader
@@ -256,13 +272,6 @@ async fn main() -> Result<()> {
         watch_counters
     )?;
 
-    Ok(())
-}
-
-fn read_tap_blocking() -> Result<()> {
-    loop {
-        std::thread::sleep(Duration::from_nanos(10));
-    }
     Ok(())
 }
 
@@ -296,7 +305,7 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<BytesMut>) ->
 #[instrument]
 async fn feed_udp(
     mut input: tokio::sync::mpsc::Receiver<BytesMut>,
-    mut udp: SplitSink<UdpFramed<LengthDelimitedCodec>, (Bytes, SocketAddr)>,
+    udp: Arc<UdpSocket>,
     peer: SocketAddr,
 ) -> Result<()> {
     loop {
@@ -309,9 +318,12 @@ async fn feed_udp(
         COUNTERS.udp_tx.pkt(b.len());
         //println!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
         if cfg!(not(feature = "bench_tap_rx")) {
-            match udp.feed((Bytes::from(b), peer)).await {
-                Ok(_) => {}
-                Err(e) => return Err(eyre!("UDP send error {}", e)),
+            let b = b.freeze();
+            let sent = udp.send(&b).await?;
+            if b.len() != sent {
+                return Err(eyre!(
+                    "UDP send could not send the whole frame, check your MTU config"
+                ));
             }
         }
     }
@@ -319,25 +331,33 @@ async fn feed_udp(
 
 #[instrument]
 async fn read_udp(
-    mut udp: SplitStream<UdpFramed<LengthDelimitedCodec>>,
-    output: tokio::sync::mpsc::Sender<BytesMut>,
+    udp: Arc<UdpSocket>,
+    output: tokio::sync::mpsc::Sender<UntrustedMessage>,
+    mtu: usize,
 ) -> Result<()> {
     loop {
-        let (pkt, _peer) = match cfg!(feature = "bench_udp_rx") {
-            true => (
-                BytesMut::zeroed(1500),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            ),
-            false => match udp.next().await {
-                Some(p) => p?,
-                None => {
-                    return Err(eyre!("UDP Peer Disconnected"));
-                } //
-            },
+        let buf = match cfg!(feature = "bench_udp_rx") {
+            true => BytesMut::zeroed(mtu),
+            false => {
+                let mut buf = BytesMut::zeroed(mtu);
+                let n = udp.recv(buf.as_mut()).await?;
+                buf.split_off(n);
+                buf
+            }
         };
+        let len = buf.len();
 
-        COUNTERS.udp_rx.pkt(pkt.len());
         //dbg!("Receiverd  {} bytes from UDP peer {}", pkt.len(), peer);
+
+        let pkt = match UntrustedMessage::from_buffer(buf) {
+            Ok(pkt) => pkt,
+            Err(e) => {
+                tracing::debug!("Could not decode header in packet {:?}", e);
+                COUNTERS.udp_invalid.pkt(len);
+                continue;
+            }
+        };
+        COUNTERS.udp_rx.pkt(len);
         output.send(pkt).await?;
     }
 }
