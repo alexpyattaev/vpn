@@ -8,11 +8,12 @@ from time import sleep
 
 def run_cmd(args:str):
     print(f"# {args}")
+    sleep(0.1)
     return subprocess.run(args, shell=True, text=True)
 
 
 #FIXME: at this point, interfaces needs to be a list of some class instance, else you go insane quick
-def add_vpn_interface(namespaces, interfaces):
+def add_vpn_interface(namespaces:list[str], interfaces:list[list[str]]):
     for x in range(2):
         run_cmd(f"ip l set {interfaces[x][0]} netns {namespaces[x]}")
         run_cmd(f"ip -n {namespaces[x]} a a {interfaces[x][-1]}/24 dev {interfaces[x][0]}")
@@ -24,20 +25,21 @@ def add_vpn_interface(namespaces, interfaces):
     run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
     run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
 
-#FIXME: make sure all functions have annontations like this
 def add_bridge(namespaces:list[str], br:str)->None:
     run_cmd(f'ip l set {br} up')
+    x = 0
     for NS in namespaces:
-        run_cmd(f"ip l set veth{NS[-1]}{NS[-1]} master {br}")
-        run_cmd(f"ip l set veth{NS[-1]}{NS[-1]} up") # FIXME: do not abuse namespace names!
+        x += 1
+        run_cmd(f"ip l set veth{x}{x} master {br}")
+        run_cmd(f"ip l set veth{x}{x} up")
 
 
-def  CleanAll(NS1, NS2):
+def  CleanAll(NS1:str, NS2:str):
     run_cmd(f'ip netns d  {NS1}')
     run_cmd(f'ip netns d {NS2}')
     #run_cmd(f"ip l d monitor_bridge")
     run_cmd(f"ip l d veth11")
-    run_cmd(f"ip l d veth22")
+    #run_cmd(f"ip l d veth22")
     res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
     print(f"I'm careful, \nso I've deleted all I've created before, here's 'ip netns list' output", res.stdout.splitlines())
 
@@ -46,11 +48,13 @@ def  CleanAll(NS1, NS2):
 def CreateNameSpaces(namespaces: list[str]):
     run_cmd(f'ip link add veth1 type veth peer name veth11')
     run_cmd(f'ip link add veth2 type veth peer name veth22')
+    x = 0
     for NS in namespaces:
+        x += 1
         run_cmd(f'ip netns add {NS}')
-        run_cmd(f'ip link set veth{NS[-1]} netns {NS}') #FIXME: abusing namespace name like this is a BAAAD idea. Really BAD. DO not.
-        run_cmd(f'ip -n {NS} a a 1.1.1.{NS[-1]}/24 dev veth{NS[-1]}')
-        run_cmd(f'ip -n {NS} l set veth{NS[-1]} up')
+        run_cmd(f'ip link set veth{x} netns {NS}')
+        run_cmd(f'ip -n {NS} a a 1.1.1.{x}/24 dev veth{x}')
+        run_cmd(f'ip -n {NS} l set veth{x} up')
     res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
 
 
