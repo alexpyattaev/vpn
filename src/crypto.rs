@@ -69,6 +69,9 @@ pub fn crypto_decryptor(
             Ok(msg) => msg,
             Err(e) => {
                 eprintln!("Deserialization failed with {e}");
+                if cfg!(test) {
+                    panic!("Deserialization failed");
+                }
                 continue;
             }
         };
@@ -82,5 +85,66 @@ pub fn crypto_decryptor(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_crypto_pair() -> (
+        (
+            tokio::sync::mpsc::Sender<BytesMut>,
+            tokio::sync::mpsc::Receiver<Bytes>,
+            tokio::task::JoinHandle<()>,
+        ),
+        (
+            tokio::sync::mpsc::Sender<UntrustedMessage>,
+            tokio::sync::mpsc::Receiver<TrustedMessage>,
+            tokio::task::JoinHandle<()>,
+        ),
+    ) {
+        let chachaparams = Arc::new(ChaChaParams {
+            key: [0x42; 32],
+            nonce: [0x42; 12],
+        });
+
+        let encryptor = {
+            let input_chan = tokio::sync::mpsc::channel(64);
+            let output_chan = tokio::sync::mpsc::channel(64);
+            let kp = chachaparams.clone();
+            let jh = tokio::task::spawn_blocking(move || {
+                crypto_encryptor(kp, input_chan.1, output_chan.0);
+            });
+            (input_chan.0, output_chan.1, jh)
+        };
+
+        let decryptor = {
+            let input_chan = tokio::sync::mpsc::channel(64);
+            let output_chan = tokio::sync::mpsc::channel(64);
+            let kp = chachaparams.clone();
+            let jh = tokio::task::spawn_blocking(move || {
+                crypto_decryptor(kp, input_chan.1, output_chan.0);
+            });
+            (input_chan.0, output_chan.1, jh)
+        };
+        (encryptor, decryptor)
+    }
+
+    #[tokio::test]
+    async fn one_small_packet() {
+        let test_data = BytesMut::from_iter('a' as u8..='z' as u8);
+        dbg!(&test_data);
+        let (mut enc, mut dec) = make_crypto_pair();
+        enc.0.send(test_data.clone()).await.unwrap();
+        let encrypted = enc.1.recv().await.unwrap();
+        dbg!(&encrypted);
+
+        let parsed = UntrustedMessage::from_buffer(BytesMut::from_iter(encrypted.iter())).unwrap();
+        dbg!(&parsed);
+        dec.0.send(parsed).await.unwrap();
+        let decrypted = dec.1.recv().await.unwrap();
+        dbg!(&decrypted);
+        assert_eq!(decrypted.body, test_data);
     }
 }

@@ -25,7 +25,7 @@ tracing-subscriber = "0.3.18"
 tun-tap = "0.1.4"
 
 [features]
-default=["bench"]
+default=[]
 bench_tap_rx=[]
 bench_udp_rx=[]
 bench=["bench_tap_rx","bench_udp_rx"]

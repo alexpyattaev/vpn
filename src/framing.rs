@@ -29,10 +29,12 @@ pub struct InnerHeader {
     pub msgkind: MsgKind,
 }
 
+#[derive(Debug)]
 pub struct UntrustedMessage {
     pub header: OuterHeader,
     pub body: BytesMut,
 }
+
 impl UntrustedMessage {
     /// Parse a raw untrusted UDP frame so it can be passed off to decryptor thread.
     /// At this point we have no idea if the frame is valid or not, obviously.
@@ -45,10 +47,56 @@ impl UntrustedMessage {
     }
 }
 
+#[derive(Debug)]
 pub struct TrustedMessage {
     pub outer_header: OuterHeader,
     pub inner_header: InnerHeader,
     pub body: BytesMut,
+}
+
+impl TrustedMessage {
+    pub fn from_untrusted_msg<F>(mut msg: UntrustedMessage, decrypt: F) -> Result<Self>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        decrypt(&mut msg.body);
+
+        let config = BinCodeConfig::default();
+
+        let (inner_header, len): (InnerHeader, usize) =
+            bincode::decode_from_slice(&msg.body, config)?;
+
+        let body = msg.body.split_off(len);
+
+        Ok(TrustedMessage {
+            outer_header: msg.header,
+            inner_header,
+            body,
+        })
+    }
+    ///Serialize all headers and form a completed payload for UDP transmission
+    pub fn serialize<F>(self, mut buf: BytesMut, encrypt: F) -> Result<Bytes>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        let config = BinCodeConfig::default();
+        let inner_header_start = bincode::encode_into_slice(self.outer_header, &mut buf, config)?;
+        let body_start = inner_header_start
+            + bincode::encode_into_slice(
+                self.inner_header,
+                &mut buf[inner_header_start..],
+                config,
+            )?;
+        let end = body_start + self.body.len();
+        buf[body_start..end].copy_from_slice(&self.body);
+        encrypt(&mut buf[inner_header_start..end]);
+        buf.truncate(end);
+        Ok(buf.freeze())
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.body.len() + 64
+    }
 }
 
 pub struct PacketFragmenter {
@@ -103,47 +151,6 @@ impl Iterator for PacketFragmenter {
             body: self.raw_packet_data.split_to(next_len),
         };
         Some(msg)
-    }
-}
-
-impl TrustedMessage {
-    pub fn from_untrusted_msg<F>(mut msg: UntrustedMessage, decrypt: F) -> Result<Self>
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        decrypt(&mut msg.body);
-
-        let config = BinCodeConfig::default();
-
-        let (inner_header, len): (InnerHeader, usize) =
-            bincode::decode_from_slice(&msg.body, config)?;
-
-        let body = msg.body.split_off(len);
-
-        Ok(TrustedMessage {
-            outer_header: msg.header,
-            inner_header,
-            body,
-        })
-    }
-    ///Serialize all headers and form a completed payload for UDP transmission
-    pub fn serialize<F>(self, mut buf: BytesMut, encrypt: F) -> Result<Bytes>
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        let config = BinCodeConfig::default();
-        let inner_header_start = bincode::encode_into_slice(self.outer_header, &mut buf, config)?;
-        let body_start =
-            inner_header_start + bincode::encode_into_slice(self.inner_header, &mut buf, config)?;
-        let end = body_start + self.body.len();
-        buf[body_start..end].copy_from_slice(&self.body);
-        encrypt(&mut buf[inner_header_start..end]);
-        buf.truncate(end);
-        Ok(buf.freeze())
-    }
-
-    pub fn buffer_len(&self) -> usize {
-        self.body.len() + 64
     }
 }
 
