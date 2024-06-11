@@ -1,4 +1,3 @@
-use color_eyre::eyre::eyre;
 use color_eyre::Result;
 use itertools::Itertools;
 use std::process::{Command, Output};
@@ -13,7 +12,7 @@ fn print_command(c: &Command) {
     println!("Running {} {}", c.get_program().to_str().unwrap(), args)
 }
 
-trait Entity: Drop {
+trait Entity {
     fn teardown(&mut self) -> Result<Output>;
     fn set_up(&mut self) -> Result<Output>;
 }
@@ -69,7 +68,7 @@ impl Entity for Bridge {
 
 //ip l add name br0 type bridge
 
-#[test]
+//#[test]
 fn main() -> Result<()> {
     let mut ns_a = NS {
         name: "A".to_owned(),

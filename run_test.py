@@ -1,10 +1,18 @@
 #!/usr/bin/python3
 
+import os
 import subprocess
 from performance_test import server_run, client_run, iperf_kill
 from time import sleep
 
 
+
+def spawn_VPN(namespace:str, remote_addr:str ="3.3.3.3", remote_port:int = 6666):
+    cmd = f'ip netns exec ./target/release/vpn --remote-address="{remote_addr}:{remote_port}"'
+    print(f"# {cmd}")
+    vpn_proc = subprocess.Popen(cmd.split(),
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return vpn_proc
 
 def run_cmd(args:str):
     print(f"# {args}")
@@ -62,9 +70,14 @@ def CreateNameSpaces(namespaces: list[str]):
 
 
 def main():
-    if subprocess.run('whoami',shell=True, text=True, capture_output=True).stdout.find('root'):
-        print(subprocess.run('whoami',shell=True, text=True, capture_output=True).stdout)
-        exit("Should run as root user, restart ")
+
+
+    if not os.path.exists('./target/release/vpn'):
+        exit("There should be a built release binary to test, run ./build.sh as a user to make one")
+
+    if os.geteuid() != 0:
+        exit("Should run as root user, else namespaces can not be created")
+
     NS1 = 's1'
     NS2 = 's2'
     vpn1 = 'tap0'
