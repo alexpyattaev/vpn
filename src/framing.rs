@@ -42,6 +42,9 @@ impl UntrustedMessage {
         let config = BinCodeConfig::default();
 
         let (header, len): (OuterHeader, usize) = bincode::decode_from_slice(&buf, config)?;
+        if header.seq == 0 {
+            return Err(eyre!("Null sequence number is not allowed"));
+        }
         let body = buf.split_off(len);
         Ok(UntrustedMessage { header, body })
     }

@@ -22,8 +22,10 @@ use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
 use clap::Parser;
-use color_eyre::eyre::eyre;
-use color_eyre::Result;
+use color_eyre::{
+    eyre::{eyre, Context},
+    Result,
+};
 use tokio_tun::Tun;
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -59,22 +61,42 @@ async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     }
 }
 
+async fn send_udp_probe(socket: &UdpSocket) -> Result<()> {
+    // Send a probe frame to check our network stack config for sanity and fail immediately if it is not
+    socket
+        .send(&[0; 64])
+        .await
+        .wrap_err_with(|| "Could not send probe packet")?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket
+        .send(&Bytes::from_iter(std::iter::repeat(0).take(64)))
+        .await
+        .wrap_err_with(|| "Could not send probe packet")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
     debug!("Arguments are {:?}", &args);
 
-    let socket = UdpSocket::bind(&args.local_address).await?;
+    let socket = {
+        let s = UdpSocket::bind(args.local_address)
+            .await
+            .wrap_err_with(|| format!("Can not bind to local address {}", args.local_address))?;
+        info!("UDP local bind successful");
+        s.connect(args.remote_address).await.wrap_err_with(|| {
+            format!(
+                "Can not find path to remote address {}",
+                args.remote_address
+            )
+        })?;
+        Arc::new(s)
+    };
+    send_udp_probe(&socket).await?;
+    info!("UDP route check successful");
 
-    info!("UDP bind successful");
-    socket.connect(args.remote_address).await?;
-    info!("UDP connect successful");
-
-    //let codec = LengthDelimitedCodec::new();
-    //let framed_socket = UdpFramed::new(socket, codec);
-
-    let socket = Arc::new(socket);
     debug!("Setting up TAP interface");
     let tun = Arc::new(
         Tun::builder()
@@ -83,10 +105,10 @@ async fn main() -> Result<()> {
             .packet_info(false) // false: IFF_NO_PI, default is true.
             .up() // or set it up manually using `sudo ip link set <tun-name> up`.
             .try_build() // or `.try_build_mq(queues)` for multi-queue support.
-            .expect("Could not register TAP interface, are you root?"),
+            .wrap_err("Could not register TAP interface, are you root?")?,
     );
 
-    info!("TAP created, name: {}", tun.name());
+    info!("TAP interface created, name: {}", tun.name());
 
     let chachaparams = Arc::new(crypto::ChaChaParams {
         key: [0x42; 32],
@@ -121,29 +143,33 @@ async fn main() -> Result<()> {
         });
         (input_chan.0, output_chan.1, jh)
     };
-    info!("Crypto thread setup complete");
+    info!("Worker thread setup complete");
 
     let udp_reader = flatten(tokio::spawn(read_udp(
         socket.clone(),
         decryptor.0,
         args.udp_mtu,
     )));
+
     let udp_writer = flatten(tokio::spawn(feed_udp(
         encryptor.1,
         socket.clone(),
         args.remote_address.clone(),
     )));
-    // TAP Reader
+
     let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.0)));
+
     let tap_writer = flatten(tokio::spawn(feed_tap(decryptor.1, tun.clone())));
 
+    //Wait for any thread to quit
     tokio::try_join!(
         udp_reader,
         udp_writer,
         tap_reader,
         tap_writer,
         watch_counters
-    )?;
+    )
+    .wrap_err("Fatal error in VPN operation, exiting")?;
 
     Ok(())
 }

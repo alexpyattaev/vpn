@@ -16,7 +16,7 @@ pub fn crypto_encryptor(
     output: tokio::sync::mpsc::Sender<Bytes>,
 ) {
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-    let mut seq = std::num::Wrapping(0u64);
+    let mut seq = std::num::Wrapping(1u64);
 
     loop {
         let msg = match input.blocking_recv() {
@@ -61,7 +61,6 @@ pub fn crypto_decryptor(
             None => break,
             Some(msg) => msg,
         };
-
         //dbg!("Encrypting buffer with {} bytes", b.len());
         cipher.seek(msg.header.seq);
 
