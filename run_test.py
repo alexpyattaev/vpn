@@ -7,6 +7,7 @@ from time import sleep
 
 
 
+
 def spawn_VPN(namespace:str, remote_addr:str ="3.3.3.3", remote_port:int = 6666):
     cmd = f'ip netns exec ./target/release/vpn --remote-address="{remote_addr}:{remote_port}"'
     print(f"# {cmd}")
@@ -20,26 +21,38 @@ def run_cmd(args:str):
     return subprocess.run(args, shell=True, text=True)
 
 
-#FIXME: at this point, interfaces needs to be a list of some class instance, else you go insane quick
-def add_vpn_interface(namespaces:list[str], interfaces:list[list[str]]):
-    for x in range(2):
-        run_cmd(f"ip l set {interfaces[x][0]} netns {namespaces[x]}")
-        run_cmd(f"ip -n {namespaces[x]} a a {interfaces[x][-1]}/24 dev {interfaces[x][0]}")
-        run_cmd(f"ip -n {namespaces[x]} l set {interfaces[x][0]} up ")
-        addr = interfaces[x][-1]
-        subnet = addr.split('.')[:-1]
-        subnet = '.'.join(subnet) + '.0'
-        run_cmd(f"ip -n {namespaces[x]} r d {subnet}/24")
-    run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
-    run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
 
-def add_bridge(namespaces:list[str], br:str)->None:
-    run_cmd(f'ip l set {br} up')
-    x = 0
-    for NS in namespaces:
-        x += 1
+
+
+class Interface:
+    name = ''
+    namespace = ''
+    ip_addr = ''
+    def __init__(self, interface_name:str, namespace:str, ip_addr:str):
+        self.name = interface_name
+        self.namespace = namespace
+        self.ip_addr = ip_addr
+    def interface_to_namespace(self):
+        run_cmd(f"ip l set {self.name} netns {self.namespace}")
+        run_cmd(f"ip -n {self.namespace} a a {self.ip_addr}/24 dev {self.name}")
+        run_cmd(f"ip -n {self.namespace} l set {self.name} up ")
+        subnet = self.ip_addr.split('.')[:-1]
+        subnet = '.'.join(subnet) + '.0'
+        run_cmd(f"ip -n {self.namespace} r d {subnet}/24")
+
+
+
+def add_bridge(namespaces:list[str], br:str):
+    try:
+        up = run_cmd(f'ip l set {br} up')
+    except Exception as e:
+        run_cmd(f"ip l a dev {br} type bridge")
+        run_cmd(f'ip l set {br} up')
+    for x in range(1,3):
         run_cmd(f"ip l set veth{x}{x} master {br}")
         run_cmd(f"ip l set veth{x}{x} up")
+
+
 
 
 def  CleanAll(NS1:str, NS2:str):
@@ -63,7 +76,6 @@ def CreateNameSpaces(namespaces: list[str]):
         run_cmd(f'ip link set veth{x} netns {NS}')
         run_cmd(f'ip -n {NS} a a 1.1.1.{x}/24 dev veth{x}')
         run_cmd(f'ip -n {NS} l set veth{x} up')
-    res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
 
 
 
@@ -82,27 +94,32 @@ def main():
     NS2 = 's2'
     vpn1 = 'tap0'
     vpn2 = 'tap1'
-
+    namespaces = [NS1,NS2]
     for n in [vpn1, vpn2]:
         run_cmd(f'ip tuntap add mode tap {n}')
 
-    NS1 = 's1'
     mon_br = 'monitor_bridge'
-    run_cmd(f"ip l a dev {mon_br} type bridge")
-    interface1 = [vpn1, '12.23.34.45']
-    interface2 = [vpn2, '23.34.45.56']
-    interfaces = [interface1, interface2]
 
-    namespaces = [NS1,NS2]
     CreateNameSpaces(namespaces)
     add_bridge(namespaces, mon_br)
+    subprocess.Popen(['wireshark','-i',mon_br,'-k'])
+    sleep(1)
+    interface1 = Interface(vpn1,NS1,'12.23.34.45')
+    interface2 = Interface(vpn2,NS2,'23.34.45.56')
+    interfaces = [interface1, interface2]
+    interafaces_ip = [interface1.ip_addr, interface2.ip_addr]
 
 
-    add_vpn_interface(namespaces, interfaces)
-    server, running_server=server_run(NS1, interface1[1])
+    for interface in interfaces:
+        interface.interface_to_namespace()
+
+    run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
+    run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
+
+    server, running_server=server_run(NS1, interface1.ip_addr)
     sleep(0.1)
     if running_server:
-        client = client_run(NS2, interfaces)
+        client = client_run(NS2, interafaces_ip)
         client.wait()
     iperf_kill(server)
     CleanAll(NS1,NS2)
