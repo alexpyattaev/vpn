@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
         })?;
         Arc::new(s)
     };
-    send_udp_probe(&socket).await?;
+    //send_udp_probe(&socket).await?;
     info!("UDP route check successful");
 
     debug!("Setting up TAP interface");
