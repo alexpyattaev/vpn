@@ -29,14 +29,19 @@ class Interface:
         self.ip_addr = ip_addr
         self.port = port
         self.remote = remote
-    def interface_to_namespace(self):
-        cmd = (f'ip netns exec {self.namespace} ./target/release/vpn -r {self.remote}:{self.port} -l {self.ip_addr}:{self.port} ')
-        print(f'# {cmd}')
 
-        subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        sleep(1)
+    def interface_to_namespace(self):
+        # Configure the IP addresses
         run_cmd(f"ip -n {self.namespace} a a {self.ip_addr}/24 dev {self.name}")
         run_cmd(f"ip -n {self.namespace} l set {self.name} up ")
+
+        cmd = (f'ip netns exec {self.namespace} ./target/release/vpn -r {self.remote}:{self.port} -l {self.ip_addr}:{self.port} ')
+        print(f'# {cmd}')
+        #inherit env
+        new_env = os.environ().copy()
+        #enable full tracing from VPN impl
+        new_env.update({"RUST_LOG":"all" })
+        subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=new_env)
         #subnet = self.ip_addr.split('.')[:-1]
         #subnet = '.'.join(subnet) + '.0'
         #run_cmd(f"ip -n {self.namespace} r d {subnet}/24")
