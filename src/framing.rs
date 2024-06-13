@@ -15,7 +15,7 @@ pub enum MsgKind {
     Keepalive,
 }
 
-#[derive(Encode, Decode, PartialEq, Debug)]
+#[derive(Encode, Decode, PartialEq, Debug, Default)]
 pub struct OuterHeader {
     /// Rolling counter of sent packets, when this wraps the world explodes
     pub seq: u64,
@@ -149,7 +149,7 @@ impl Iterator for PacketFragmenter {
         self.frag_backptr += next_len;
 
         let msg = TrustedMessage {
-            outer_header: OuterHeader { seq: 0 },
+            outer_header: OuterHeader::default(),
             inner_header: InnerHeader { msgkind },
             body: self.raw_packet_data.split_to(next_len),
         };

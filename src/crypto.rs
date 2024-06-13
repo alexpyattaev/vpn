@@ -12,39 +12,37 @@ pub struct ChaChaParams {
 //#[instrument]
 pub fn crypto_encryptor(
     params: Arc<ChaChaParams>,
-    mut input: tokio::sync::mpsc::Receiver<BytesMut>,
+    mut input: tokio::sync::mpsc::Receiver<TrustedMessage>,
     output: tokio::sync::mpsc::Sender<Bytes>,
 ) {
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
     let mut seq = std::num::Wrapping(1u64);
 
     loop {
-        let msg = match input.blocking_recv() {
+        let mut msg = match input.blocking_recv() {
             None => break,
             Some(msg) => msg,
         };
 
-        for mut msg in PacketFragmenter::new(msg, 1300) {
-            {
-                msg.outer_header.seq = seq.0;
-                cipher.seek(msg.outer_header.seq);
-                seq += 1;
-            }
+        {
+            msg.outer_header.seq = seq.0;
+            cipher.seek(msg.outer_header.seq);
+            seq += 1;
+        }
 
-            //dbg!("Encrypting buffer with {} bytes", b.len());
-            let buf = BytesMut::zeroed(msg.buffer_len());
-            let buf = msg
-                .serialize(buf, |b| cipher.apply_keystream(b))
-                .expect("Serialization should never fail");
+        //dbg!("Encrypting buffer with {} bytes", b.len());
+        let buf = BytesMut::zeroed(msg.buffer_len());
+        let buf = msg
+            .serialize(buf, |b| cipher.apply_keystream(b))
+            .expect("Serialization should never fail");
 
-            match output.blocking_send(buf) {
-                Ok(_) => {}
-                Err(e) => {
-                    dbg!(&e);
-                    println!("{}", &e.to_string());
-                    //panic!("WAAA");
-                    return;
-                }
+        match output.blocking_send(buf) {
+            Ok(_) => {}
+            Err(e) => {
+                dbg!(&e);
+                println!("{}", &e.to_string());
+                //panic!("WAAA");
+                return;
             }
         }
     }
@@ -87,6 +85,7 @@ pub fn crypto_decryptor(
     }
 }
 
+#[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
     use super::*;

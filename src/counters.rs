@@ -104,8 +104,14 @@ impl CountersAll {
         elapsed: tokio::time::Duration,
         f: &mut impl Wtf,
     ) -> Result<()> {
+        let state =
+            if crate::keepalive::CONNECTION_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+                "DOWN"
+            } else {
+                "UP"
+            };
         let s = format!(
-            r"Uptime {elapsed:#?}
+            r"Uptime {elapsed:#?} Link {state}
 UDP TX {}
 UDP RX {}
 TAP TX {}

@@ -1,13 +1,16 @@
 mod crypto;
 mod framing;
+mod keepalive;
 use crypto::{crypto_decryptor, crypto_encryptor};
-use framing::{TrustedMessage, UntrustedMessage};
+use framing::{PacketFragmenter, TrustedMessage, UntrustedMessage};
 mod counters;
 
 use counters::{watch_counters, COUNTERS};
 use std::{
     fmt::Debug,
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::atomic::Ordering,
 };
 
 use tokio::{
@@ -23,7 +26,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::{
-    eyre::{eyre, Context},
+    eyre::{eyre, Context, Report, WrapErr},
     Result,
 };
 use tokio_tun::Tun;
@@ -61,23 +64,26 @@ async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     }
 }
 
-async fn send_udp_probe(socket: &UdpSocket) -> Result<()> {
-    // Send a probe frame to check our network stack config for sanity and fail immediately if it is not
-    socket
-        .send(&[0; 64])
-        .await
-        .wrap_err_with(|| "Could not send probe packet")?;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    socket
-        .send(&Bytes::from_iter(std::iter::repeat(0).take(64)))
-        .await
-        .wrap_err_with(|| "Could not send probe packet")?;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+    //let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
+    //tracing_subscriber::fmt().with_writer(non_blocking).init();
+    {
+        // install global collector configured based on RUST_LOG env var.
+
+        let subscriber = tracing_subscriber::fmt()
+            // Use a more compact, abbreviated log format
+            .compact()
+            // Display source code file paths
+            .with_file(true)
+            // Display source code line numbers
+            .with_line_number(true)
+            // Build the subscriber
+            .finish();
+        // use that subscriber to process traces emitted after this point
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
     let args = Args::parse();
     debug!("Arguments are {:?}", &args);
 
@@ -94,7 +100,6 @@ async fn main() -> Result<()> {
         })?;
         Arc::new(s)
     };
-    //send_udp_probe(&socket).await?;
     info!("UDP route check successful");
 
     debug!("Setting up TAP interface");
@@ -110,18 +115,19 @@ async fn main() -> Result<()> {
 
     info!("TAP interface created, name: {}", tun.name());
 
+    // Key and IV must be references to the `GenericArray` type.
     let chachaparams = Arc::new(crypto::ChaChaParams {
         key: [0x42; 32],
         nonce: [0x42; 12],
     });
 
-    // Key and IV must be references to the `GenericArray` type.
-    let interval = tokio::time::interval_at(
-        Instant::now() + Duration::from_secs(1),
-        Duration::from_millis(1000),
-    );
-
-    let watch_counters = flatten(tokio::spawn(watch_counters(interval)));
+    let watch_counters = {
+        let interval = tokio::time::interval_at(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1000),
+        );
+        flatten(tokio::spawn(watch_counters(interval)))
+    };
     //TODO have a pool of these around
     let encryptor = {
         let input_chan = tokio::sync::mpsc::channel(64);
@@ -145,6 +151,12 @@ async fn main() -> Result<()> {
     };
     info!("Worker thread setup complete");
 
+    let timeout_ticks = {
+        let tick = Duration::from_millis(100);
+        let timeout = Duration::from_millis(1000);
+        let s = encryptor.0.clone();
+        flatten(tokio::spawn(keepalive::keepalive_ticks(tick, timeout, s)))
+    };
     let udp_reader = flatten(tokio::spawn(read_udp(
         socket.clone(),
         decryptor.0,
@@ -167,7 +179,8 @@ async fn main() -> Result<()> {
         udp_writer,
         tap_reader,
         tap_writer,
-        watch_counters
+        watch_counters,
+        timeout_ticks,
     )
     .wrap_err("Fatal error in VPN operation, exiting")?;
 
@@ -185,10 +198,10 @@ fn bytes_mut_uninit(size: usize) -> BytesMut {
 }
 
 #[instrument(skip(tun))]
-async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<BytesMut>) -> Result<()> {
-    //let mut interval = tokio::time::interval(Duration::from_nanos(10));
+async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessage>) -> Result<()> {
     loop {
         let mut buf = bytes_mut_uninit(1800);
+
         let n = match cfg!(feature = "bench_tap_rx") {
             true => 1500,
             false => tun.recv(&mut buf).await?,
@@ -200,7 +213,10 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<BytesMut>) ->
             buf.set_len(n);
         }
         //println!("reading {} bytes: {:?}", n, &buf[..n]);
-        output.send(buf).await?;
+
+        for msg in PacketFragmenter::new(buf, 1300) {
+            output.send(msg).await?;
+        }
     }
 }
 
@@ -218,9 +234,16 @@ async fn feed_udp(
             }
         };
         COUNTERS.udp_tx.pkt(b.len());
+        keepalive::packet_tx();
         //println!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
         if cfg!(not(feature = "bench_tap_rx")) {
-            let sent = udp.send(&b).await?;
+            let sent = match udp.send(&b).await {
+                Ok(s) => s,
+                Err(e) => match e.kind() {
+                    ErrorKind::ConnectionRefused | ErrorKind::Interrupted => continue,
+                    _ => return Err(Report::new(e).wrap_err("UDP send encountered a fatal error")),
+                },
+            };
             if b.len() != sent {
                 return Err(eyre!(
                     "UDP send could not send the whole frame, check your MTU config"
@@ -253,7 +276,7 @@ async fn read_udp(
         let pkt = match UntrustedMessage::from_buffer(buf) {
             Ok(pkt) => pkt,
             Err(e) => {
-                tracing::debug!("Could not decode header in packet {:?}", e);
+                debug!("Could not decode header in packet {:?}", e);
                 COUNTERS.udp_invalid.pkt(len);
                 continue;
             }
@@ -273,14 +296,16 @@ async fn feed_tap(
             Some(p) => p,
             None => {
                 return Err(eyre!("No more data to feed TAP"));
-            } //
+            }
         };
+
+        keepalive::packet_rx();
         match pkt.inner_header.msgkind {
             framing::MsgKind::FirstFragment(s) => {
                 println!("Got data packet of size {s}");
             }
             framing::MsgKind::Fragment(bp) => {
-                println!(
+                eprintln!(
                     "Got fragment with backpointer {bp}, no idea how to reassemble, dropping it"
                 );
                 continue;
