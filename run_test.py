@@ -8,12 +8,7 @@ from time import sleep
 
 
 
-def spawn_VPN(namespace:str, remote_addr:str ="3.3.3.3", remote_port:int = 6666):
-    cmd = f'ip netns exec ./target/release/vpn --remote-address="{remote_addr}:{remote_port}"'
-    print(f"# {cmd}")
-    vpn_proc = subprocess.Popen(cmd.split(),
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return vpn_proc
+
 
 def run_cmd(args:str):
     print(f"# {args}")
@@ -28,24 +23,31 @@ class Interface:
     name = ''
     namespace = ''
     ip_addr = ''
-    def __init__(self, interface_name:str, namespace:str, ip_addr:str):
+    def __init__(self, interface_name:str, namespace:str, ip_addr:str, port:int, remote:str):
         self.name = interface_name
         self.namespace = namespace
         self.ip_addr = ip_addr
+        self.port = port
+        self.remote = remote
     def interface_to_namespace(self):
-        run_cmd(f"ip l set {self.name} netns {self.namespace}")
+        cmd = (f'ip netns exec {self.namespace} ./target/release/vpn -r {self.remote}:{self.port} -l {self.ip_addr}:{self.port} ')
+        print(f'# {cmd}')
+
+        subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sleep(1)
         run_cmd(f"ip -n {self.namespace} a a {self.ip_addr}/24 dev {self.name}")
         run_cmd(f"ip -n {self.namespace} l set {self.name} up ")
-        subnet = self.ip_addr.split('.')[:-1]
-        subnet = '.'.join(subnet) + '.0'
-        run_cmd(f"ip -n {self.namespace} r d {subnet}/24")
+        #subnet = self.ip_addr.split('.')[:-1]
+        #subnet = '.'.join(subnet) + '.0'
+        #run_cmd(f"ip -n {self.namespace} r d {subnet}/24")
+        #run_cmd(f'ip -n {self.namespace} a')
+        #run_cmd(f'ip -n {self.namespace} l')
+        #un_cmd(f'ip -n {self.namespace} r')
 
 
-
-def add_bridge(namespaces:list[str], br:str):
-    try:
-        up = run_cmd(f'ip l set {br} up')
-    except Exception as e:
+def add_bridge(br:str):
+    up = subprocess.run(f'ip l set {br} up', shell=True, text=True)
+    if up.returncode == 1:
         run_cmd(f"ip l a dev {br} type bridge")
         run_cmd(f'ip l set {br} up')
     for x in range(1,3):
@@ -60,7 +62,7 @@ def  CleanAll(NS1:str, NS2:str):
     run_cmd(f'ip netns d {NS2}')
     #run_cmd(f"ip l d monitor_bridge")
     run_cmd(f"ip l d veth11")
-    #run_cmd(f"ip l d veth22")
+    run_cmd(f"ip l d veth22")
     res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
     print(f"I'm careful, \nso I've deleted all I've created before, here's 'ip netns list' output", res.stdout.splitlines())
 
@@ -92,37 +94,34 @@ def main():
 
     NS1 = 's1'
     NS2 = 's2'
+    namespaces = [NS1,NS2]
     vpn1 = 'tap0'
     vpn2 = 'tap1'
-    namespaces = [NS1,NS2]
-    for n in [vpn1, vpn2]:
-        run_cmd(f'ip tuntap add mode tap {n}')
-
     mon_br = 'monitor_bridge'
 
     CreateNameSpaces(namespaces)
-    add_bridge(namespaces, mon_br)
+    add_bridge(mon_br)
+    run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
+    run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
     subprocess.Popen(['wireshark','-i',mon_br,'-k'])
-    sleep(1)
-    interface1 = Interface(vpn1,NS1,'12.23.34.45')
-    interface2 = Interface(vpn2,NS2,'23.34.45.56')
+    sleep(1.5)
+    interface1 = Interface(vpn1,NS1,'1.1.1.3',7777,'1.1.1.4')
+    interface2 = Interface(vpn1,NS2,'1.1.1.4',8888,'1.1.1.3')
     interfaces = [interface1, interface2]
-    interafaces_ip = [interface1.ip_addr, interface2.ip_addr]
 
 
     for interface in interfaces:
         interface.interface_to_namespace()
 
-    run_cmd("ip -n s1 r a default via 1.1.1.2 dev veth1")
-    run_cmd("ip -n s2 r a default via 1.1.1.1 dev veth2")
 
-    server, running_server=server_run(NS1, interface1.ip_addr)
+
+    server, running_server=server_run(NS1, interface1.ip_addr, interface1.port)
     sleep(0.1)
     if running_server:
-        client = client_run(NS2, interafaces_ip)
+        client = client_run(NS2, interface2.ip_addr,interface2.remote, interface1.port, interface2.port,)
         client.wait()
     iperf_kill(server)
-    CleanAll(NS1,NS2)
+    #CleanAll(NS1,NS2)
 
 
 
