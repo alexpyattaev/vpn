@@ -174,6 +174,7 @@ async fn main() -> Result<()> {
 
     let tap_writer = flatten(tokio::spawn(feed_tap(decryptor.1, tun.clone())));
 
+    info!("Init sequence completed, VPN ready");
     //Wait for any thread to quit
     tokio::try_join!(
         udp_reader,
@@ -218,6 +219,11 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessag
 
         // prepare fragmenter & update sequence numbers
         let pf = PacketFragmenter::new(buf, 1300, &TX_SEQUENCE_ALLOCATOR);
+        debug!(
+            "Received {} bytes from tap, fragmented into {} packets",
+            n,
+            pf.len()
+        );
         // block pipe for needed number of messages (to avoid re-syncing for each)
         let permit = output.reserve_many(pf.len()).await?;
         // dump all fragments in order into the pipe
@@ -242,7 +248,7 @@ async fn feed_udp(
         };
         COUNTERS.udp_tx.pkt(b.len());
         keepalive::packet_tx();
-        //println!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
+        debug!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
         if cfg!(not(feature = "bench_tap_rx")) {
             let sent = match udp.send(&b).await {
                 Ok(s) => s,
@@ -278,7 +284,7 @@ async fn read_udp(
         };
         let len = buf.len();
 
-        //dbg!("Receiverd  {} bytes from UDP peer {}", pkt.len(), peer);
+        debug!("Receiverd  {} bytes from UDP", buf.len());
 
         let pkt = match UntrustedMessage::from_buffer(buf) {
             Ok(pkt) => pkt,
@@ -330,7 +336,7 @@ async fn feed_tap(
                 continue;
             }
             _ => {
-                debug!("Got data packet of size {}", pkt.body.len());
+                debug!("Got data fragment of size {}", pkt.body.len());
                 match assembler.add_msg(pkt) {
                     Ok(None) => {
                         debug!("Not enough to assemble full packet");

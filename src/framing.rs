@@ -6,6 +6,7 @@ use bincode::{Decode, Encode};
 use bytes::{Bytes, BytesMut};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
+use tracing::debug;
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum MsgKind {
@@ -25,6 +26,7 @@ pub struct OuterHeader {
     //pub signature:u8,
 }
 
+//TODO: add magic number to InnerHeader
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub struct InnerHeader {
     /// Message type selector
@@ -275,7 +277,6 @@ impl<const N: usize> Reassembler<N> {
             MsgKind::Fragment(o) => m.outer_header.seq - o as u64,
             MsgKind::Keepalive => unreachable!(),
         };
-        dbg!(&m, first_seq);
 
         //Look for non-empty pipelines first
         for pl in self.pipelines.iter_mut() {
@@ -295,6 +296,10 @@ impl<const N: usize> Reassembler<N> {
     pub fn check_stale(&mut self, seq_min: u64) {
         for pl in self.pipelines.iter_mut() {
             if !pl.is_empty() && pl.seq_first < seq_min {
+                debug!(
+                    "Stale assembly pipeline for seq {} detected, clearing",
+                    pl.seq_first
+                );
                 pl.clear();
             }
         }
