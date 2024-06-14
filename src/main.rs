@@ -2,15 +2,14 @@ mod crypto;
 mod framing;
 mod keepalive;
 use crypto::{crypto_decryptor, crypto_encryptor};
-use framing::{PacketFragmenter, TrustedMessage, UntrustedMessage};
+use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
 
 use counters::{watch_counters, COUNTERS};
 use std::{
-    fmt::Debug,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::atomic::Ordering,
+    sync::atomic::AtomicU64,
 };
 
 use tokio::{
@@ -26,7 +25,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use color_eyre::{
-    eyre::{eyre, Context, Report, WrapErr},
+    eyre::{eyre, Context, Report},
     Result,
 };
 use tokio_tun::Tun;
@@ -51,10 +50,12 @@ struct Args {
 use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 // Import relevant traits
 
 //use hex_literal::hex;
+
+pub static TX_SEQUENCE_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
 
 async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
     match handle.await {
@@ -166,7 +167,7 @@ async fn main() -> Result<()> {
     let udp_writer = flatten(tokio::spawn(feed_udp(
         encryptor.1,
         socket.clone(),
-        args.remote_address.clone(),
+        args.remote_address,
     )));
 
     let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.0)));
@@ -206,16 +207,22 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessag
             true => 1500,
             false => tun.recv(&mut buf).await?,
         };
-
-        COUNTERS.tap_rx.pkt(n);
-
+        //SAFETY this is okay since we've just read exactly that many bytes,
+        //recv can not write past end of buffer,
+        //and we do not trust this data anyway;
         unsafe {
             buf.set_len(n);
         }
-        //println!("reading {} bytes: {:?}", n, &buf[..n]);
 
-        for msg in PacketFragmenter::new(buf, 1300) {
-            output.send(msg).await?;
+        COUNTERS.tap_rx.pkt(n);
+
+        // prepare fragmenter & update sequence numbers
+        let pf = PacketFragmenter::new(buf, 1300, &TX_SEQUENCE_ALLOCATOR);
+        // block pipe for needed number of messages (to avoid re-syncing for each)
+        let permit = output.reserve_many(pf.len()).await?;
+        // dump all fragments in order into the pipe
+        for (p, m) in permit.zip(pf) {
+            p.send(m);
         }
     }
 }
@@ -291,6 +298,11 @@ async fn feed_tap(
     mut input: tokio::sync::mpsc::Receiver<TrustedMessage>,
     tun: Arc<Tun>,
 ) -> Result<()> {
+    // max amount of bytes for possible packet reorderings
+    let max_lookback_seq = 5000;
+    let mut assembler = Reassembler::<8>::new();
+    //Todo: move logic around rx_seq_max to reassembler
+    let mut rx_seq_max = 0;
     loop {
         let pkt = match input.recv().await {
             Some(p) => p,
@@ -299,26 +311,46 @@ async fn feed_tap(
             }
         };
 
-        keepalive::packet_rx();
-        match pkt.inner_header.msgkind {
-            framing::MsgKind::FirstFragment(s) => {
-                println!("Got data packet of size {s}");
-            }
-            framing::MsgKind::Fragment(bp) => {
-                eprintln!(
-                    "Got fragment with backpointer {bp}, no idea how to reassemble, dropping it"
+        rx_seq_max = rx_seq_max.max(pkt.outer_header.seq);
+
+        if pkt.outer_header.seq < rx_seq_max {
+            let d = rx_seq_max - pkt.outer_header.seq;
+            if d > max_lookback_seq {
+                warn!(
+                    "Got stale packet with seq {}, relevant seq {}, dropping",
+                    pkt.outer_header.seq, rx_seq_max
                 );
-                continue;
-            }
-            framing::MsgKind::Keepalive => {
-                println!("Got keepalive");
             }
         }
 
-        let pkt = pkt.body; //TODO: implement proper reassembly of fragmented packets
+        keepalive::packet_rx();
+        let pkt = match pkt.inner_header.msgkind {
+            framing::MsgKind::Keepalive => {
+                debug!("Got keepalive");
+                continue;
+            }
+            _ => {
+                debug!("Got data packet of size {}", pkt.body.len());
+                match assembler.add_msg(pkt) {
+                    Ok(None) => {
+                        debug!("Not enough to assemble full packet");
+                        continue;
+                    }
+                    Ok(Some((s, p))) => {
+                        debug!("Assembled packet with seq {} length {}", s, p.len());
+                        p
+                    }
+                    Err(e) => {
+                        warn!("Reassembly failed with error {e}");
+                        continue;
+                    }
+                }
+            }
+        };
 
         let n = tun.send(&pkt).await?;
         COUNTERS.tap_tx.pkt(n);
-        //dbg!("Forwarded  {} bytes to TAP", n);
+        // prevent junk from accumulating in reassembly buffer
+        assembler.check_stale(rx_seq_max - max_lookback_seq);
     }
 }

@@ -1,4 +1,4 @@
-use crate::framing::{PacketFragmenter, TrustedMessage, UntrustedMessage};
+use crate::framing::{TrustedMessage, UntrustedMessage};
 use bytes::{Bytes, BytesMut};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
@@ -16,19 +16,17 @@ pub fn crypto_encryptor(
     output: tokio::sync::mpsc::Sender<Bytes>,
 ) {
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-    let mut seq = std::num::Wrapping(1u64);
 
     loop {
-        let mut msg = match input.blocking_recv() {
-            None => break,
+        let msg = match input.blocking_recv() {
+            None => {
+                tracing::debug!("No more data for encryptor to receive, exiting thread");
+                break;
+            }
             Some(msg) => msg,
         };
 
-        {
-            msg.outer_header.seq = seq.0;
-            cipher.seek(msg.outer_header.seq);
-            seq += 1;
-        }
+        cipher.seek(msg.outer_header.seq);
 
         //dbg!("Encrypting buffer with {} bytes", b.len());
         let buf = BytesMut::zeroed(msg.buffer_len());
@@ -39,9 +37,7 @@ pub fn crypto_encryptor(
         match output.blocking_send(buf) {
             Ok(_) => {}
             Err(e) => {
-                dbg!(&e);
-                println!("{}", &e.to_string());
-                //panic!("WAAA");
+                tracing::error!("Encryptor thread could not send frame, error {}", &e);
                 return;
             }
         }
@@ -56,16 +52,18 @@ pub fn crypto_decryptor(
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
     loop {
         let msg = match input.blocking_recv() {
-            None => break,
+            None => {
+                tracing::debug!("No more packets for decryptor to consume, exiting");
+                break;
+            }
             Some(msg) => msg,
         };
-        //dbg!("Encrypting buffer with {} bytes", b.len());
         cipher.seek(msg.header.seq);
 
         let msg = match TrustedMessage::from_untrusted_msg(msg, |b| cipher.apply_keystream(b)) {
             Ok(msg) => msg,
             Err(e) => {
-                eprintln!("Deserialization failed with {e}");
+                tracing::error!("Deserialization failed with {e}");
                 if cfg!(test) {
                     panic!("Deserialization failed");
                 }
@@ -76,9 +74,7 @@ pub fn crypto_decryptor(
         match output.blocking_send(msg) {
             Ok(_) => {}
             Err(e) => {
-                dbg!(&e);
-                println!("{}", &e.to_string());
-                //panic!("WAAA");
+                tracing::error!("Decryptor thread could not send frame, error {}", &e);
                 return;
             }
         }
@@ -135,7 +131,7 @@ mod tests {
     async fn one_small_packet() {
         let test_data = BytesMut::from_iter('a' as u8..='z' as u8);
         let test_msg = TrustedMessage {
-            outer_header: OuterHeader::default(),
+            outer_header: OuterHeader { seq: 1 },
             inner_header: InnerHeader {
                 msgkind: MsgKind::FirstFragment(test_data.len() as u16),
             },

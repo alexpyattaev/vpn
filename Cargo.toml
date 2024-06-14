@@ -13,6 +13,7 @@ clap = { version = "4.5.4", features = ["derive"] }
 color-eyre = "0.6.3"
 futures = "0.3.30"
 itertools = "0.12.1"
+rand = "0.8.5"
 serde = { version = "1.0.198", features = ["derive"] }
 si-scale = "0.2.2"
 sorted-vec = "0.8.3"

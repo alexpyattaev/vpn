@@ -10,8 +10,6 @@ use tokio::time::Instant;
 
 use color_eyre::Result;
 
-use tokio::time::Duration;
-
 use std::sync::atomic::AtomicBool;
 
 use std::sync::atomic::AtomicU64;
@@ -44,7 +42,9 @@ pub async fn keepalive_ticks(
             );
             sender
                 .send(TrustedMessage {
-                    outer_header: OuterHeader::default(),
+                    outer_header: OuterHeader {
+                        seq: crate::TX_SEQUENCE_ALLOCATOR.fetch_add(1, Ordering::SeqCst),
+                    },
                     inner_header: InnerHeader {
                         msgkind: MsgKind::Keepalive,
                     },

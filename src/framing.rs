@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+
 use crate::counters::COUNTERS;
 use bincode::config::{BigEndian, Configuration, Fixint, Limit};
 use bincode::{Decode, Encode};
@@ -15,7 +17,7 @@ pub enum MsgKind {
     Keepalive,
 }
 
-#[derive(Encode, Decode, PartialEq, Debug, Default)]
+#[derive(Encode, Decode, PartialEq, Debug)]
 pub struct OuterHeader {
     /// Rolling counter of sent packets, when this wraps the world explodes
     pub seq: u64,
@@ -107,24 +109,26 @@ pub struct PacketFragmenter {
     raw_packet_data: BytesMut,
     // how many bytes precede this fragment's start in the packet
     frag_backptr: usize,
-    // MTU for fragmentation
-    mtu: usize,
+    // desired fragment size for this packet. This will always ensure that the fragments are smaller than MTU, and will try to keep them same length
+    fragsize: usize,
+    // sequence for next fragment
+    seq: u64,
+    // total number of fragments left to make
+    fragments_left: usize,
 }
 
 impl PacketFragmenter {
-    pub fn new(pkt: BytesMut, mtu: usize) -> Self {
+    pub fn new(pkt: BytesMut, mtu: usize, base_seq: &AtomicU64) -> Self {
+        let base_seq = base_seq.fetch_add(pkt.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        let nfrag = pkt.len().div_ceil(mtu);
+        let fragsize = pkt.len().div_ceil(nfrag).min(mtu);
         Self {
             raw_packet_data: pkt,
-            mtu,
+            fragsize,
             frag_backptr: 0,
+            seq: base_seq,
+            fragments_left: nfrag,
         }
-    }
-
-    fn next_fragment_len(&self) -> usize {
-        if self.raw_packet_data.len() > self.mtu {
-            return self.mtu;
-        }
-        return self.raw_packet_data.len();
     }
 }
 
@@ -132,10 +136,11 @@ impl Iterator for PacketFragmenter {
     type Item = TrustedMessage;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_len = self.next_fragment_len();
-        if next_len == 0 {
+        if self.fragments_left == 0 {
             return None;
         }
+        self.fragments_left -= 1;
+        let next_len = self.raw_packet_data.len().min(self.fragsize);
 
         let msgkind = match self.frag_backptr {
             // first fragment, indicate full length of the entire packet
@@ -149,17 +154,28 @@ impl Iterator for PacketFragmenter {
         self.frag_backptr += next_len;
 
         let msg = TrustedMessage {
-            outer_header: OuterHeader::default(),
+            outer_header: OuterHeader { seq: self.seq },
             inner_header: InnerHeader { msgkind },
             body: self.raw_packet_data.split_to(next_len),
         };
+        self.seq += next_len as u64;
         Some(msg)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.fragments_left, Some(self.fragments_left))
+    }
+}
+
+impl std::iter::ExactSizeIterator for PacketFragmenter {
+    fn len(&self) -> usize {
+        self.fragments_left
     }
 }
 
 type BinCodeConfig = Configuration<BigEndian, Fixint, Limit<128>>;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Fragment {
     pub seq: u64,
     pub bytes: BytesMut,
@@ -174,7 +190,7 @@ impl From<TrustedMessage> for Fragment {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Pipeline {
     seq_first: u64,
     seq_last: Option<u64>,
@@ -182,7 +198,7 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<Vec<Fragment>>> {
+    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<(u64, BytesMut)>> {
         match m.inner_header.msgkind {
             MsgKind::FirstFragment(o) => {
                 self.seq_first = m.outer_header.seq;
@@ -191,21 +207,25 @@ impl Pipeline {
             }
             MsgKind::Fragment(o) => {
                 COUNTERS.fragments_rx.pkt(m.body.len());
+                let start_seq = m.outer_header.seq - o as u64;
                 if self.fragments.is_empty() {
-                    self.seq_first = m.outer_header.seq;
-                } else if self.seq_first != (m.outer_header.seq - o as u64) {
+                    self.seq_first = start_seq;
+                } else if self.seq_first != start_seq {
                     return Err(eyre!("Sequence mismatch"));
                 }
                 self.fragments.push(Fragment::from(m));
             }
             MsgKind::Keepalive => unreachable!(),
         }
+        dbg!(&self);
         if self.is_complete() {
-            let mut x = sorted_vec::SortedSet::new();
-            std::mem::swap(&mut self.fragments, &mut x);
-            let res = Some(x.into_vec());
+            let mut res = BytesMut::new();
+            for p in self.fragments.iter() {
+                res.extend_from_slice(&p.bytes)
+            }
+            let rv = Ok(Some((self.seq_first, res)));
             self.clear();
-            Ok(res)
+            rv
         } else {
             Ok(None)
         }
@@ -217,7 +237,7 @@ impl Pipeline {
         self.seq_first = 0;
     }
     pub fn is_empty(&self) -> bool {
-        return self.fragments.is_empty();
+        self.fragments.is_empty()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -233,7 +253,7 @@ impl Pipeline {
             }
             need_seq += f.bytes.len() as u64;
         }
-        return need_seq == seq_last;
+        need_seq == seq_last
     }
 }
 
@@ -249,12 +269,13 @@ impl<const N: usize> Reassembler<N> {
         }
     }
 
-    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<Vec<Fragment>>> {
+    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<(u64, BytesMut)>> {
         let first_seq = match m.inner_header.msgkind {
             MsgKind::FirstFragment(_o) => m.outer_header.seq,
             MsgKind::Fragment(o) => m.outer_header.seq - o as u64,
             MsgKind::Keepalive => unreachable!(),
         };
+        dbg!(&m, first_seq);
 
         //Look for non-empty pipelines first
         for pl in self.pipelines.iter_mut() {
@@ -270,5 +291,90 @@ impl<const N: usize> Reassembler<N> {
         }
 
         Err(eyre!("No pipeline for reassembly found!"))
+    }
+    pub fn check_stale(&mut self, seq_min: u64) {
+        for pl in self.pipelines.iter_mut() {
+            if !pl.is_empty() && pl.seq_first < seq_min {
+                pl.clear();
+            }
+        }
+    }
+}
+
+#[allow(clippy::all)]
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use rand::prelude::*;
+
+    #[test]
+    fn fragmented_packets() -> Result<()> {
+        let mtu = 10;
+        let initial_seq = 42;
+        for n in [9, 10, 12, 20, 21, 30, 35] {
+            let seq = AtomicU64::new(initial_seq);
+            let test_data = BytesMut::from_iter(('a' as u8..='z' as u8).cycle().take(n));
+            let mut fragmenter = PacketFragmenter::new(test_data.clone(), mtu, &seq);
+            let mut assembler = Reassembler::<5>::new();
+            let (rs, assembled) = loop {
+                let m = fragmenter.next().unwrap();
+                match assembler.add_msg(m) {
+                    Ok(Some(m)) => break m,
+                    Ok(None) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            dbg!(rs);
+            assert_eq!(
+                rs, initial_seq,
+                "Sequence number of recovered packet at length {n}"
+            );
+            assert_eq!(
+                assembled, test_data,
+                "Assembled data does not match sent at length {n}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_order_fragmented_packets() -> Result<()> {
+        let mtu = 10;
+        let initial_seq = 42;
+
+        for n in [9, 10, 12, 20, 21, 30, 35] {
+            let seq = AtomicU64::new(initial_seq);
+            let test_data1 = BytesMut::from_iter(('a' as u8..='z' as u8).cycle().take(n));
+            let test_data2 = BytesMut::from_iter(('A' as u8..='Z' as u8).cycle().take(n));
+
+            let mut fragments: Vec<TrustedMessage> =
+                PacketFragmenter::new(test_data1.clone(), mtu, &seq).collect();
+            fragments.extend(PacketFragmenter::new(test_data2.clone(), mtu, &seq));
+
+            {
+                let mut rng = rand::thread_rng();
+                fragments.shuffle(&mut rng);
+            }
+
+            let mut assembler = Reassembler::<4>::new();
+            let mut assembled = vec![];
+            for f in fragments {
+                match assembler.add_msg(f) {
+                    Ok(Some(m)) => assembled.push(m),
+                    Ok(None) => {
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            assembled.sort();
+            for (rx, tx) in assembled.iter().zip([test_data1, test_data2]) {
+                assert_eq!(tx, rx.1, "mismatch at seq {}", rx.0);
+            }
+        }
+        Ok(())
     }
 }
