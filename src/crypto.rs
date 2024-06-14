@@ -88,11 +88,13 @@ pub fn crypto_decryptor(
 #[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
+    use crate::framing::{InnerHeader, MsgKind, OuterHeader};
+
     use super::*;
 
     fn make_crypto_pair() -> (
         (
-            tokio::sync::mpsc::Sender<BytesMut>,
+            tokio::sync::mpsc::Sender<TrustedMessage>,
             tokio::sync::mpsc::Receiver<Bytes>,
             tokio::task::JoinHandle<()>,
         ),
@@ -132,9 +134,16 @@ mod tests {
     #[tokio::test]
     async fn one_small_packet() {
         let test_data = BytesMut::from_iter('a' as u8..='z' as u8);
+        let test_msg = TrustedMessage {
+            outer_header: OuterHeader::default(),
+            inner_header: InnerHeader {
+                msgkind: MsgKind::FirstFragment(test_data.len() as u16),
+            },
+            body: test_data.clone(),
+        };
         dbg!(&test_data);
         let (mut enc, mut dec) = make_crypto_pair();
-        enc.0.send(test_data.clone()).await.unwrap();
+        enc.0.send(test_msg).await.unwrap();
         let encrypted = enc.1.recv().await.unwrap();
         dbg!(&encrypted);
 

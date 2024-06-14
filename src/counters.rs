@@ -66,8 +66,8 @@ impl Counters {
         let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
         CountersDispl {
             d: elapsed,
-            pkt: pkt,
-            bytes: bytes,
+            pkt,
+            bytes,
         }
     }
 }
