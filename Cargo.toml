@@ -23,7 +23,7 @@ tokio-util = { version = "0.7.10", features = ["full"] }
 tracing = { version = "0.1.40", features = ["async-await"] }
 tracing-appender = "0.2.3"
 tracing-attributes = { version = "0.1.27", features = ["async-await"] }
-tracing-subscriber = "0.3.18"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 tun-tap = "0.1.4"
 
 [features]

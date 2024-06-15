@@ -32,9 +32,11 @@ pub async fn keepalive_ticks(
     let tick_ms = tick.as_millis() as u64;
     let timeout_ticks = timeout.as_millis() as u64 / tick_ms;
     loop {
-        let cur_time = CURRENT_PACKET_TIME.fetch_add(1, Ordering::SeqCst);
+        let cur_time = CURRENT_PACKET_TIME.fetch_add(1, Ordering::SeqCst) + 1;
         interval.tick().await;
+        //dbg!(cur_time, LAST_TX_PACKET_TIME.load(Ordering::SeqCst));
         let since_last_tx = cur_time - LAST_TX_PACKET_TIME.load(Ordering::SeqCst);
+        //dbg!(since_last_tx, cur_time, timeout_ticks, tick_ms);
         if since_last_tx > timeout_ticks {
             debug!(
                 "Sending keepalive packet, {} ms since last UDP tx",
@@ -87,8 +89,9 @@ pub fn packet_rx() {
 }
 
 pub fn packet_tx() {
-    LAST_TX_PACKET_TIME.store(
+    let old = LAST_TX_PACKET_TIME.swap(
         CURRENT_PACKET_TIME.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
+    //dbg!(old);
 }

@@ -11,6 +11,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::atomic::AtomicU64,
 };
+use tracing_subscriber::layer::SubscriberExt;
 
 use tokio::{
     net::UdpSocket,
@@ -50,7 +51,7 @@ struct Args {
 use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, subscriber, warn};
 // Import relevant traits
 
 //use hex_literal::hex;
@@ -73,7 +74,14 @@ async fn main() -> Result<()> {
     {
         // install global collector configured based on RUST_LOG env var.
 
+        use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+        let filter = EnvFilter::builder()
+            .with_default_directive(LevelFilter::ERROR.into())
+            .with_env_var("TRACE_LOG")
+            .from_env()?;
+
         let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
             // Use a more compact, abbreviated log format
             .compact()
             // Display source code file paths
@@ -82,6 +90,7 @@ async fn main() -> Result<()> {
             .with_line_number(true)
             // Build the subscriber
             .finish();
+
         // use that subscriber to process traces emitted after this point
         tracing::subscriber::set_global_default(subscriber)?;
     }
@@ -199,7 +208,7 @@ fn bytes_mut_uninit(size: usize) -> BytesMut {
     buf
 }
 
-#[instrument(skip(tun))]
+#[instrument(skip(tun, output))]
 async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessage>) -> Result<()> {
     loop {
         let mut buf = bytes_mut_uninit(1800);
@@ -233,7 +242,7 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessag
     }
 }
 
-#[instrument]
+#[instrument(skip(input, udp, peer))]
 async fn feed_udp(
     mut input: tokio::sync::mpsc::Receiver<Bytes>,
     udp: Arc<UdpSocket>,
@@ -266,7 +275,7 @@ async fn feed_udp(
     }
 }
 
-#[instrument]
+#[instrument(skip(output, udp, mtu))]
 async fn read_udp(
     udp: Arc<UdpSocket>,
     output: tokio::sync::mpsc::Sender<UntrustedMessage>,
@@ -299,7 +308,7 @@ async fn read_udp(
     }
 }
 
-#[instrument(skip(tun))]
+#[instrument(skip(input, tun))]
 async fn feed_tap(
     mut input: tokio::sync::mpsc::Receiver<TrustedMessage>,
     tun: Arc<Tun>,

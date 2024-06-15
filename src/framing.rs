@@ -219,7 +219,6 @@ impl Pipeline {
             }
             MsgKind::Keepalive => unreachable!(),
         }
-        dbg!(&self);
         if self.is_complete() {
             let mut res = BytesMut::new();
             for p in self.fragments.iter() {
