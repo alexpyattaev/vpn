@@ -16,7 +16,7 @@ def run_cmd(args:str):
 
 
 class Namespace:
-    def __init__(self, name:str, ip_addr:str, port:int,  remote:str):
+    def __init__(self, name:str, ip_addr:str, port:int,  remote:str, test_ip:str):
         self.veth_name = "veth_"+name
         self.outer_veth_name = "veth_out_"+name
         self.name = name
@@ -24,6 +24,8 @@ class Namespace:
         self.port = port
         self.remote = remote
         self.print_logs = False
+        self.test_ip = test_ip
+
 
     def spawn_veths(self):
         run_cmd(f'ip netns add {self.name}')
@@ -49,13 +51,24 @@ class Namespace:
         l = sys.stdout if self.print_logs  else None
 
 
-        subprocess.Popen(cmd.split(), env=new_env, stdout=l, stderr=l)
+        self.vpn = subprocess.Popen(cmd.split(), env=None, stdout=subprocess.DEVNULL, stderr=l)
         #subnet = self.ip_addr.split('.')[:-1]
         #subnet = '.'.join(subnet) + '.0'
         #run_cmd(f"ip -n {self.namespace} r d {subnet}/24")
         #run_cmd(f'ip -n {self.namespace} a')
         #run_cmd(f'ip -n {self.namespace} l')
         #un_cmd(f'ip -n {self.namespace} r')
+
+
+    def test_bridge(self):
+        run_cmd(f'ip -n {self.name} l a br0 type bridge')
+        run_cmd(f'ip -n {self.name} l set tap0 master br0')
+        run_cmd(f'ip -n {self.name} l set br0 up')
+        run_cmd(f'ip -n {self.name} a a {self.test_ip}/24 dev br0')
+
+
+
+
 
 
 def add_bridge(name:str, veths:list[str]):
@@ -71,17 +84,22 @@ def add_bridge(name:str, veths:list[str]):
         run_cmd(f"ip l set {ve} up")
 
 
+def set_default_routes(NS1:Namespace, NS2:Namespace):
+    run_cmd(f"ip -n {NS1.name} r a default via {NS2.ip_addr} dev {NS1.veth_name}")
+    run_cmd(f"ip -n {NS2.name} r a default via {NS1.ip_addr} dev {NS2.veth_name}")
+
+
 
 
 def  CleanAll(namespaces:list[Namespace]):
-    run_cmd(f"killall wireshark")
+    #run_cmd(f"killall wireshark")
     run_cmd(f"killall iperf3")
 
     run_cmd(f"ip l d monitor_bridge")
 
 
     for n in namespaces:
-        run_cmd(f"ip -n {n.name} l d {n.veth_name}")
+        run_cmd(f"ip l d {n.outer_veth_name}")
         run_cmd(f'ip netns d  {n.name}')
 
     res = subprocess.run('ip netns list',shell=True, text=True, capture_output=True)
@@ -104,13 +122,11 @@ def main():
 
     NS1 = 's1'
     NS2 = 's2'
-    vpn1 = 'tap0'
-    vpn2 = 'tap1'
     mon_br_name = 'monitor_bridge'
     namespaces=[]
     try:
-        interface1 = Namespace(name= NS1, ip_addr='1.1.1.3', port=7777, remote='1.1.1.4')
-        interface2 = Namespace(name= NS2, ip_addr='1.1.1.4', port=7777, remote='1.1.1.3')
+        interface1 = Namespace(name= NS1, ip_addr='1.1.1.3', port=7777, remote='1.1.1.4',test_ip='2.2.2.1')
+        interface2 = Namespace(name= NS2, ip_addr='1.1.1.4', port=7777, remote='1.1.1.3',test_ip='2.2.2.2')
         namespaces = [interface1, interface2]
 
         for n in namespaces:
@@ -129,23 +145,36 @@ def main():
         for n in namespaces:
             n.ip_config()
 
-        namespaces[0].print_logs = True
+        #namespaces[0].print_logs = True
+
+        set_default_routes(interface1, interface2)
 
         for n in namespaces:
             n.spawn_vpn_perf()
 
+        for n in namespaces:
+            n.test_bridge()
+
+
+
         input("Press enter to run perf test")
 
-        server, running_server=server_run(NS1, interface1.ip_addr, interface1.port)
+        server, running_server=server_run(NS=NS1, server_ip=interface1.test_ip)
         try:
             sleep(0.1)
             if running_server:
-                client = client_run(NS2, interface2.ip_addr,interface2.remote, interface1.port, interface2.port,)
+                client = client_run(NS=NS2, client_ip=interface2.test_ip,serv_ip=interface1.test_ip)
                 client.wait()
         finally:
             iperf_kill(server)
+
+        for n in namespaces:
+            n.vpn.kill()
+
+
     finally:
         CleanAll(namespaces)
+
 
 
 
