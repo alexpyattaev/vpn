@@ -36,13 +36,16 @@ class Namespace:
         run_cmd(f"ip -n {self.name} a a {self.ip_addr}/24 dev {self.veth_name}")
         run_cmd(f"ip -n {self.name} l set {self.veth_name} up ")
 
-    def spawn_vpn(self):
+    def spawn_vpn_perf(self):
+        self.spawn_vpn(log_level="critical")
+
+    def spawn_vpn(self, log_level="debug"):
         cmd = (f'ip netns exec {self.name} ./target/release/vpn -r {self.remote}:{self.port} -l {self.ip_addr}:{self.port} ')
         print(f'# {cmd}')
         #inherit env
         new_env = os.environ.copy()
         #enable full tracing from VPN impl
-        new_env.update({"TRACE_LOG":"debug" })
+        new_env.update({"TRACE_LOG":log_level })
         l = sys.stdout if self.print_logs  else None
 
 
@@ -129,7 +132,7 @@ def main():
         namespaces[0].print_logs = True
 
         for n in namespaces:
-            n.spawn_vpn()
+            n.spawn_vpn_perf()
 
         input("Press enter to run perf test")
 
