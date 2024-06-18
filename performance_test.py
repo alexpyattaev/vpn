@@ -17,7 +17,7 @@ def server_run(NS:str, server_ip:str):
 
 
 def client_run(NS:str, serv_ip:str, client_ip:str):
-    args = ['ip','netns','exec',NS,'iperf3','-c',serv_ip,'-B',client_ip,'-b 0','-i 0.125']
+    args = ['ip','netns','exec',NS,'iperf3','-c',serv_ip,'-B',client_ip,'-b 0','-i 0.125','--bidir']
     print(" ".join(str(element) for element in args))
     c = subprocess.Popen(args)
     return c
