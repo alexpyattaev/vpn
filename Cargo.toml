@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-channel = "2.3.1"
+base64 = "0.22.1"
 bincode = "2.0.0-rc.3"
 bytes = "1.6.0"
 chacha20 = "0.9.1"
@@ -27,7 +29,8 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 tun-tap = "0.1.4"
 
 [features]
-default=[]
-bench_tap_rx=[]
-bench_udp_rx=[]
-bench=["bench_tap_rx","bench_udp_rx"]
+default = []
+bench_tap_rx = []
+bench_udp_rx = []
+packet_tracing = []
+bench = ["bench_tap_rx", "bench_udp_rx"]

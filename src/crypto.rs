@@ -2,8 +2,17 @@ use crate::framing::{TrustedMessage, UntrustedMessage};
 use bytes::{Bytes, BytesMut};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
+use color_eyre::eyre::Result;
 use std::sync::Arc;
 
+pub fn decode_key_base64<const N: usize>(input: &str) -> Result<[u8; N]> {
+    use base64::prelude::BASE64_STANDARD;
+
+    use base64::Engine;
+    let d = BASE64_STANDARD.decode(input)?;
+    let k = <&[u8; N]>::try_from(&d[0..N])?;
+    Ok(*k)
+}
 pub struct ChaChaParams {
     pub key: [u8; 32],
     pub nonce: [u8; 12],
@@ -12,18 +21,18 @@ pub struct ChaChaParams {
 //#[instrument]
 pub fn crypto_encryptor(
     params: Arc<ChaChaParams>,
-    mut input: tokio::sync::mpsc::Receiver<TrustedMessage>,
-    output: tokio::sync::mpsc::Sender<Bytes>,
+    input: async_channel::Receiver<TrustedMessage>,
+    output: async_channel::Sender<Bytes>,
 ) {
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
 
     loop {
-        let msg = match input.blocking_recv() {
-            None => {
-                tracing::debug!("No more data for encryptor to receive, exiting thread");
+        let msg = match input.recv_blocking() {
+            Err(_) => {
+                tracing::debug!("No more data fo encryptor to receive, exiting thread");
                 break;
             }
-            Some(msg) => msg,
+            Ok(msg) => msg,
         };
 
         cipher.seek(msg.outer_header.seq);
@@ -34,7 +43,7 @@ pub fn crypto_encryptor(
             .serialize(buf, |b| cipher.apply_keystream(b))
             .expect("Serialization should never fail");
 
-        match output.blocking_send(buf) {
+        match output.send_blocking(buf) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Encryptor thread could not send frame, error {}", &e);
@@ -46,17 +55,17 @@ pub fn crypto_encryptor(
 
 pub fn crypto_decryptor(
     params: Arc<ChaChaParams>,
-    mut input: tokio::sync::mpsc::Receiver<UntrustedMessage>,
-    output: tokio::sync::mpsc::Sender<TrustedMessage>,
+    input: async_channel::Receiver<UntrustedMessage>,
+    output: async_channel::Sender<TrustedMessage>,
 ) {
     let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
     loop {
-        let msg = match input.blocking_recv() {
-            None => {
+        let msg = match input.recv_blocking() {
+            Err(_) => {
                 tracing::debug!("No more packets for decryptor to consume, exiting");
                 break;
             }
-            Some(msg) => msg,
+            Ok(msg) => msg,
         };
         cipher.seek(msg.header.seq);
 
@@ -71,7 +80,7 @@ pub fn crypto_decryptor(
             }
         };
 
-        match output.blocking_send(msg) {
+        match output.send_blocking(msg) {
             Ok(_) => {}
             Err(e) => {
                 tracing::error!("Decryptor thread could not send frame, error {}", &e);
@@ -84,19 +93,19 @@ pub fn crypto_decryptor(
 #[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
-    use crate::framing::{InnerHeader, MsgKind, OuterHeader};
-
     use super::*;
+    use crate::framing::{InnerHeader, MsgKind, OuterHeader};
+    use async_channel::{bounded, Receiver, Sender};
 
     fn make_crypto_pair() -> (
         (
-            tokio::sync::mpsc::Sender<TrustedMessage>,
-            tokio::sync::mpsc::Receiver<Bytes>,
+            Sender<TrustedMessage>,
+            Receiver<Bytes>,
             tokio::task::JoinHandle<()>,
         ),
         (
-            tokio::sync::mpsc::Sender<UntrustedMessage>,
-            tokio::sync::mpsc::Receiver<TrustedMessage>,
+            Sender<UntrustedMessage>,
+            Receiver<TrustedMessage>,
             tokio::task::JoinHandle<()>,
         ),
     ) {
@@ -106,8 +115,8 @@ mod tests {
         });
 
         let encryptor = {
-            let input_chan = tokio::sync::mpsc::channel(64);
-            let output_chan = tokio::sync::mpsc::channel(64);
+            let input_chan = bounded(64);
+            let output_chan = bounded(64);
             let kp = chachaparams.clone();
             let jh = tokio::task::spawn_blocking(move || {
                 crypto_encryptor(kp, input_chan.1, output_chan.0);
@@ -116,8 +125,8 @@ mod tests {
         };
 
         let decryptor = {
-            let input_chan = tokio::sync::mpsc::channel(64);
-            let output_chan = tokio::sync::mpsc::channel(64);
+            let input_chan = bounded(64);
+            let output_chan = bounded(64);
             let kp = chachaparams.clone();
             let jh = tokio::task::spawn_blocking(move || {
                 crypto_decryptor(kp, input_chan.1, output_chan.0);
@@ -138,7 +147,7 @@ mod tests {
             body: test_data.clone(),
         };
         dbg!(&test_data);
-        let (mut enc, mut dec) = make_crypto_pair();
+        let (enc, dec) = make_crypto_pair();
         enc.0.send(test_msg).await.unwrap();
         let encrypted = enc.1.recv().await.unwrap();
         dbg!(&encrypted);

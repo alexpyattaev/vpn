@@ -1,7 +1,8 @@
 mod crypto;
 mod framing;
 mod keepalive;
-use crypto::{crypto_decryptor, crypto_encryptor};
+use async_channel::bounded;
+use crypto::{crypto_decryptor, crypto_encryptor, decode_key_base64};
 use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
 
@@ -11,7 +12,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::atomic::AtomicU64,
 };
-use tracing_subscriber::layer::SubscriberExt;
 
 use tokio::{
     net::UdpSocket,
@@ -45,13 +45,29 @@ struct Args {
     /// The Maximum Transfer Unit to use for the UDP side of the VPN
     #[arg(short, long, default_value_t = 1500)]
     udp_mtu: usize,
+
+    /// Number of encoder threads for encryption of packets
+    #[arg(short, long, default_value_t = 3)]
+    encoder_threads: usize,
+
+    /// Number of decoder threads for decrpytion of packets
+    #[arg(short, long, default_value_t = 3)]
+    decoder_threads: usize,
+
+    // Encryption key, base64 (RFC 4648) encoded, must be 32 bytes long.
+    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2MDcwODA5MTAxMTEyMTMxNDE1Cg=="))]
+    key: String,
+
+    // CHACHA20 nonce, base64 (RFC 4648) encoded, must be 12 bytes.
+    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2Cg=="))]
+    nonce: String,
 }
 
 //use tracing::{span, Level};
 use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
 
-use tracing::{debug, info, subscriber, warn};
+use tracing::{debug, info, warn};
 // Import relevant traits
 
 //use hex_literal::hex;
@@ -124,11 +140,10 @@ async fn main() -> Result<()> {
     );
 
     info!("TAP interface created, name: {}", tun.name());
-
     // Key and IV must be references to the `GenericArray` type.
     let chachaparams = Arc::new(crypto::ChaChaParams {
-        key: [0x42; 32],
-        nonce: [0x42; 12],
+        key: decode_key_base64(&args.key)?,
+        nonce: decode_key_base64(&args.nonce)?,
     });
 
     let watch_counters = {
@@ -140,8 +155,8 @@ async fn main() -> Result<()> {
     };
     //TODO have a pool of these around
     let encryptor = {
-        let input_chan = tokio::sync::mpsc::channel(64);
-        let output_chan = tokio::sync::mpsc::channel(64);
+        let input_chan = bounded(64);
+        let output_chan = bounded(64);
         let kp = chachaparams.clone();
         let jh = tokio::task::spawn_blocking(move || {
             crypto_encryptor(kp, input_chan.1, output_chan.0);
@@ -150,8 +165,8 @@ async fn main() -> Result<()> {
         (input_chan.0, output_chan.1, jh)
     };
     let decryptor = {
-        let input_chan = tokio::sync::mpsc::channel(64);
-        let output_chan = tokio::sync::mpsc::channel(64);
+        let input_chan = bounded(64);
+        let output_chan = bounded(64);
         let kp = chachaparams.clone();
         let jh = tokio::task::spawn_blocking(move || {
             crypto_decryptor(kp, input_chan.1, output_chan.0);
@@ -209,7 +224,7 @@ fn bytes_mut_uninit(size: usize) -> BytesMut {
 }
 
 #[instrument(skip(tun, output))]
-async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessage>) -> Result<()> {
+async fn read_tap(tun: Arc<Tun>, output: async_channel::Sender<TrustedMessage>) -> Result<()> {
     loop {
         let mut buf = bytes_mut_uninit(1800);
 
@@ -228,36 +243,40 @@ async fn read_tap(tun: Arc<Tun>, output: tokio::sync::mpsc::Sender<TrustedMessag
 
         // prepare fragmenter & update sequence numbers
         let pf = PacketFragmenter::new(buf, 1300, &TX_SEQUENCE_ALLOCATOR);
-        debug!(
-            "Received {} bytes from tap, fragmented into {} packets",
-            n,
-            pf.len()
-        );
+        if cfg!(feature = "packet_tracing") {
+            debug!(
+                "Received {} bytes from tap, fragmented into {} packets",
+                n,
+                pf.len()
+            );
+        }
+        for f in pf {
+            output.send(f).await?;
+        }
+        /*
         // block pipe for needed number of messages (to avoid re-syncing for each)
         let permit = output.reserve_many(pf.len()).await?;
         // dump all fragments in order into the pipe
         for (p, m) in permit.zip(pf) {
             p.send(m);
         }
+        */
     }
 }
 
 #[instrument(skip(input, udp, peer))]
 async fn feed_udp(
-    mut input: tokio::sync::mpsc::Receiver<Bytes>,
+    input: async_channel::Receiver<Bytes>,
     udp: Arc<UdpSocket>,
     peer: SocketAddr,
 ) -> Result<()> {
     loop {
-        let b = match input.recv().await {
-            Some(b) => b,
-            None => {
-                return Err(eyre!("Peer disconnected"));
-            }
-        };
+        let b = input.recv().await.wrap_err("Peer disconnected")?;
         COUNTERS.udp_tx.pkt(b.len());
         keepalive::packet_tx();
-        debug!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
+        if cfg!(feature = "packet_tracing") {
+            debug!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
+        }
         if cfg!(not(feature = "bench_tap_rx")) {
             let sent = match udp.send(&b).await {
                 Ok(s) => s,
@@ -275,10 +294,10 @@ async fn feed_udp(
     }
 }
 
-#[instrument(skip(output, udp, mtu))]
+//#[instrument(skip(output, udp, mtu))]
 async fn read_udp(
     udp: Arc<UdpSocket>,
-    output: tokio::sync::mpsc::Sender<UntrustedMessage>,
+    output: async_channel::Sender<UntrustedMessage>,
     mtu: usize,
 ) -> Result<()> {
     loop {
@@ -293,12 +312,14 @@ async fn read_udp(
         };
         let len = buf.len();
 
-        debug!("Receiverd  {} bytes from UDP", buf.len());
+        if cfg!(feature = "packet_tracing") {
+            debug!("Receiverd  {} bytes from UDP", buf.len());
+        }
 
         let pkt = match UntrustedMessage::from_buffer(buf) {
             Ok(pkt) => pkt,
             Err(e) => {
-                debug!("Could not decode header in packet {:?}", e);
+                warn!("Could not decode header in packet {:?}", e);
                 COUNTERS.udp_invalid.pkt(len);
                 continue;
             }
@@ -308,23 +329,18 @@ async fn read_udp(
     }
 }
 
-#[instrument(skip(input, tun))]
-async fn feed_tap(
-    mut input: tokio::sync::mpsc::Receiver<TrustedMessage>,
-    tun: Arc<Tun>,
-) -> Result<()> {
+//#[instrument(skip(input, tun))]
+async fn feed_tap(input: async_channel::Receiver<TrustedMessage>, tun: Arc<Tun>) -> Result<()> {
     // max amount of bytes for possible packet reorderings
     let max_lookback_seq = 5000;
     let mut assembler = Reassembler::<8>::new();
     //Todo: move logic around rx_seq_max to reassembler
     let mut rx_seq_max = 0;
     loop {
-        let pkt = match input.recv().await {
-            Some(p) => p,
-            None => {
-                return Err(eyre!("No more data to feed TAP"));
-            }
-        };
+        let pkt = input
+            .recv()
+            .await
+            .wrap_err("No more data for TAP availabe")?;
 
         rx_seq_max = rx_seq_max.max(pkt.outer_header.seq);
 
@@ -341,18 +357,26 @@ async fn feed_tap(
         keepalive::packet_rx();
         let pkt = match pkt.inner_header.msgkind {
             framing::MsgKind::Keepalive => {
-                debug!("Got keepalive");
+                if cfg!(feature = "packet_tracing") {
+                    debug!("Got keepalive");
+                }
                 continue;
             }
             _ => {
-                debug!("Got data fragment of size {}", pkt.body.len());
+                if cfg!(feature = "packet_tracing") {
+                    debug!("Got data fragment of size {}", pkt.body.len());
+                }
                 match assembler.add_msg(pkt) {
                     Ok(None) => {
-                        debug!("Not enough to assemble full packet");
+                        if cfg!(feature = "packet_tracing") {
+                            debug!("Not enough to assemble full packet");
+                        }
                         continue;
                     }
                     Ok(Some((s, p))) => {
-                        debug!("Assembled packet with seq {} length {}", s, p.len());
+                        if cfg!(feature = "packet_tracing") {
+                            debug!("Assembled packet with seq {} length {}", s, p.len());
+                        }
                         p
                     }
                     Err(e) => {

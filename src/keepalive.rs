@@ -25,7 +25,7 @@ pub static CONNECTION_BROKEN: AtomicBool = AtomicBool::new(false);
 pub async fn keepalive_ticks(
     tick: tokio::time::Duration,
     timeout: tokio::time::Duration,
-    sender: tokio::sync::mpsc::Sender<TrustedMessage>,
+    sender: async_channel::Sender<TrustedMessage>,
 ) -> Result<()> {
     let start = Instant::now();
     let mut interval = tokio::time::interval_at(start, tick);
@@ -89,9 +89,8 @@ pub fn packet_rx() {
 }
 
 pub fn packet_tx() {
-    let old = LAST_TX_PACKET_TIME.swap(
+    LAST_TX_PACKET_TIME.store(
         CURRENT_PACKET_TIME.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
-    //dbg!(old);
 }
