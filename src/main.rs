@@ -55,11 +55,11 @@ struct Args {
     decoder_threads: usize,
 
     // Encryption key, base64 (RFC 4648) encoded, must be 32 bytes long.
-    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2MDcwODA5MTAxMTEyMTMxNDE1Cg=="))]
+    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2MDcwODA5MTAxMTEyMTMxNDE1MTY="))]
     key: String,
 
     // CHACHA20 nonce, base64 (RFC 4648) encoded, must be 12 bytes.
-    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2Cg=="))]
+    #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2"))]
     nonce: String,
 
     // Encryption mode. Sign only encrypts first 32 bytes of every packet to avoid injection of junk.
@@ -137,10 +137,15 @@ async fn main() -> Result<()> {
 
     info!("TAP interface created, name: {}", tun.name());
     // Key and IV must be references to the `GenericArray` type.
-    let chachaparams = crypto::ChaChaParams {
-        key: decode_key_base64(&args.key)?,
-        nonce: decode_key_base64(&args.nonce)?,
-        mode: args.crypto_mode,
+
+    let chachaparams = {
+        let key = decode_key_base64(&args.key).wrap_err("Could not parse key")?;
+        let nonce = decode_key_base64(&args.nonce).wrap_err("Could not parse nonce")?;
+        crypto::ChaChaParams {
+            key,
+            nonce,
+            mode: args.crypto_mode,
+        }
     };
 
     let watch_counters = {

@@ -4,14 +4,27 @@ use async_channel::{bounded, Receiver, Sender};
 use bytes::{Bytes, BytesMut};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
-use color_eyre::eyre::{Context, Result};
+use color_eyre::eyre::{eyre, Context, Result};
 
 pub fn decode_key_base64<const N: usize>(input: &str) -> Result<[u8; N]> {
     use base64::prelude::BASE64_STANDARD;
 
     use base64::Engine;
-    let d = BASE64_STANDARD.decode(input)?;
-    let k = <&[u8; N]>::try_from(&d[0..N])?;
+    let d = BASE64_STANDARD
+        .decode(input)
+        .wrap_err("Invalid base64 value provided")?;
+
+    let (k, tail) = d
+        .as_slice()
+        .split_first_chunk::<N>()
+        .ok_or_else(|| eyre!("Not enough bytes provided, got {} expected {N}", d.len()))?;
+
+    if !tail.is_empty() {
+        return Err(eyre!(
+            "Too many bytes provided, got {} expected {N}",
+            d.len()
+        ));
+    }
     Ok(*k)
 }
 
