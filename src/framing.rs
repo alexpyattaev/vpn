@@ -23,7 +23,7 @@ pub struct OuterHeader {
     /// Rolling counter of sent packets, when this wraps the world explodes
     pub seq: u64,
     // A signature that allows the crypto engine to reject obviously invalid packets
-    //pub signature:u8,
+    //pub signature: u16,
 }
 
 //TODO: add magic number to InnerHeader

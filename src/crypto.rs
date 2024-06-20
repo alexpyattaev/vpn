@@ -1,9 +1,10 @@
 use crate::framing::{TrustedMessage, UntrustedMessage};
+use crate::util::flatten;
+use async_channel::{bounded, Receiver, Sender};
 use bytes::{Bytes, BytesMut};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
-use color_eyre::eyre::Result;
-use std::sync::Arc;
+use color_eyre::eyre::{Context, Result};
 
 pub fn decode_key_base64<const N: usize>(input: &str) -> Result<[u8; N]> {
     use base64::prelude::BASE64_STANDARD;
@@ -13,127 +14,174 @@ pub fn decode_key_base64<const N: usize>(input: &str) -> Result<[u8; N]> {
     let k = <&[u8; N]>::try_from(&d[0..N])?;
     Ok(*k)
 }
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+pub enum CryptoMode {
+    Encrypt,
+    Sign,
+}
+
+#[derive(Clone, Debug)]
 pub struct ChaChaParams {
     pub key: [u8; 32],
     pub nonce: [u8; 12],
+    pub mode: CryptoMode,
 }
 
-//#[instrument]
-pub fn crypto_encryptor(
-    params: Arc<ChaChaParams>,
-    input: async_channel::Receiver<TrustedMessage>,
-    output: async_channel::Sender<Bytes>,
-) {
-    let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-
-    loop {
-        let msg = match input.recv_blocking() {
-            Err(_) => {
-                tracing::debug!("No more data fo encryptor to receive, exiting thread");
-                break;
-            }
-            Ok(msg) => msg,
-        };
-
-        cipher.seek(msg.outer_header.seq);
-
-        //dbg!("Encrypting buffer with {} bytes", b.len());
-        let buf = BytesMut::zeroed(msg.buffer_len());
-        let buf = msg
-            .serialize(buf, |b| cipher.apply_keystream(b))
-            .expect("Serialization should never fail");
-
-        match output.send_blocking(buf) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("Encryptor thread could not send frame, error {}", &e);
-                return;
-            }
+pub struct Encryptor {
+    params: ChaChaParams,
+    pub input: Sender<TrustedMessage>,
+    pub output: Receiver<Bytes>,
+    worker_input: Receiver<TrustedMessage>,
+    worker_output: Sender<Bytes>,
+}
+impl Encryptor {
+    pub fn new(params: ChaChaParams) -> Self {
+        let input_chan = bounded(64);
+        let output_chan = bounded(64);
+        Self {
+            params,
+            input: input_chan.0,
+            output: output_chan.1,
+            worker_input: input_chan.1,
+            worker_output: output_chan.0,
         }
     }
-}
 
-pub fn crypto_decryptor(
-    params: Arc<ChaChaParams>,
-    input: async_channel::Receiver<UntrustedMessage>,
-    output: async_channel::Sender<TrustedMessage>,
-) {
-    let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-    loop {
-        let msg = match input.recv_blocking() {
-            Err(_) => {
-                tracing::debug!("No more packets for decryptor to consume, exiting");
-                break;
-            }
-            Ok(msg) => msg,
+    pub async fn spawn(&self) -> Result<()> {
+        let i = self.worker_input.clone();
+        let o = self.worker_output.clone();
+        let p = self.params.clone();
+        flatten(tokio::task::spawn_blocking(move || Self::work(p, i, o))).await
+    }
+
+    fn work(
+        params: ChaChaParams,
+        input: async_channel::Receiver<TrustedMessage>,
+        output: async_channel::Sender<Bytes>,
+    ) -> Result<()> {
+        let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
+
+        let enc = match params.mode {
+            CryptoMode::Encrypt => apply_keystream_full,
+            CryptoMode::Sign => apply_keystream_partial::<32>,
         };
-        cipher.seek(msg.header.seq);
 
-        let msg = match TrustedMessage::from_untrusted_msg(msg, |b| cipher.apply_keystream(b)) {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!("Deserialization failed with {e}");
-                if cfg!(test) {
-                    panic!("Deserialization failed");
+        loop {
+            let msg = match input.recv_blocking() {
+                Err(_) => {
+                    tracing::debug!("No more data fo encryptor to receive, exiting thread");
+                    break;
                 }
-                continue;
-            }
-        };
+                Ok(msg) => msg,
+            };
 
-        match output.send_blocking(msg) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("Decryptor thread could not send frame, error {}", &e);
-                return;
-            }
+            cipher.seek(msg.outer_header.seq);
+
+            //dbg!("Encrypting buffer with {} bytes", b.len());
+            let buf = BytesMut::zeroed(msg.buffer_len());
+            let buf = msg
+                .serialize(buf, |b| enc(b, &mut cipher))
+                .wrap_err("Serialization should never fail")?;
+
+            output
+                .send_blocking(buf)
+                .wrap_err("Encryptor thread could not send frame into channel")?;
         }
+        Ok(())
     }
 }
 
+fn apply_keystream_full(b: &mut [u8], c: &mut ChaCha20) {
+    c.apply_keystream(b);
+}
+
+fn apply_keystream_partial<const N: usize>(b: &mut [u8], c: &mut ChaCha20) {
+    let l = b.len().min(N);
+    c.apply_keystream(&mut b[..l]);
+}
+
+pub struct Decryptor {
+    params: ChaChaParams,
+    pub input: Sender<UntrustedMessage>,
+    pub output: Receiver<TrustedMessage>,
+    pub worker_input: Receiver<UntrustedMessage>,
+    pub worker_output: Sender<TrustedMessage>,
+}
+impl Decryptor {
+    pub fn new(params: ChaChaParams) -> Self {
+        let input_chan = bounded(64);
+        let output_chan = bounded(64);
+        Self {
+            params,
+            input: input_chan.0,
+            output: output_chan.1,
+            worker_input: input_chan.1,
+            worker_output: output_chan.0,
+        }
+    }
+    pub async fn spawn(&self) -> Result<()> {
+        let i = self.worker_input.clone();
+        let o = self.worker_output.clone();
+        let p = self.params.clone();
+        flatten(tokio::task::spawn_blocking(move || Self::work(p, i, o))).await
+    }
+
+    fn work(
+        params: ChaChaParams,
+        input: Receiver<UntrustedMessage>,
+        output: Sender<TrustedMessage>,
+    ) -> Result<()> {
+        let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
+        let dec = match params.mode {
+            CryptoMode::Encrypt => apply_keystream_full,
+            CryptoMode::Sign => apply_keystream_partial::<32>,
+        };
+        loop {
+            let msg = match input.recv_blocking() {
+                Err(_) => {
+                    tracing::debug!("No more packets for decryptor to consume, exiting");
+                    break;
+                }
+                Ok(msg) => msg,
+            };
+            cipher.seek(msg.header.seq);
+
+            let msg = match TrustedMessage::from_untrusted_msg(msg, |b| dec(b, &mut cipher)) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::error!("Deserialization failed with {e}");
+                    if cfg!(test) {
+                        panic!("Deserialization failed");
+                    }
+                    continue;
+                }
+            };
+
+            output
+                .send_blocking(msg)
+                .wrap_err("Decryptor thread could not send frame to channel")?;
+        }
+        Ok(())
+    }
+}
 #[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::framing::{InnerHeader, MsgKind, OuterHeader};
-    use async_channel::{bounded, Receiver, Sender};
 
-    fn make_crypto_pair() -> (
-        (
-            Sender<TrustedMessage>,
-            Receiver<Bytes>,
-            tokio::task::JoinHandle<()>,
-        ),
-        (
-            Sender<UntrustedMessage>,
-            Receiver<TrustedMessage>,
-            tokio::task::JoinHandle<()>,
-        ),
-    ) {
-        let chachaparams = Arc::new(ChaChaParams {
+    fn make_crypto_pair() -> (Encryptor, Decryptor) {
+        let params = ChaChaParams {
             key: [0x42; 32],
             nonce: [0x42; 12],
-        });
-
-        let encryptor = {
-            let input_chan = bounded(64);
-            let output_chan = bounded(64);
-            let kp = chachaparams.clone();
-            let jh = tokio::task::spawn_blocking(move || {
-                crypto_encryptor(kp, input_chan.1, output_chan.0);
-            });
-            (input_chan.0, output_chan.1, jh)
+            mode: CryptoMode::Encrypt,
         };
 
-        let decryptor = {
-            let input_chan = bounded(64);
-            let output_chan = bounded(64);
-            let kp = chachaparams.clone();
-            let jh = tokio::task::spawn_blocking(move || {
-                crypto_decryptor(kp, input_chan.1, output_chan.0);
-            });
-            (input_chan.0, output_chan.1, jh)
-        };
-        (encryptor, decryptor)
+        (
+            Encryptor::new(params.clone()),
+            Decryptor::new(params.clone()),
+        )
     }
 
     #[tokio::test]
@@ -148,14 +196,18 @@ mod tests {
         };
         dbg!(&test_data);
         let (enc, dec) = make_crypto_pair();
-        enc.0.send(test_msg).await.unwrap();
-        let encrypted = enc.1.recv().await.unwrap();
+
+        let _ejh = enc.spawn();
+        let _djh = dec.spawn();
+
+        enc.input.send(test_msg).await.unwrap();
+        let encrypted = enc.output.recv().await.unwrap();
         dbg!(&encrypted);
 
         let parsed = UntrustedMessage::from_buffer(BytesMut::from_iter(encrypted.iter())).unwrap();
         dbg!(&parsed);
-        dec.0.send(parsed).await.unwrap();
-        let decrypted = dec.1.recv().await.unwrap();
+        dec.input.send(parsed).await.unwrap();
+        let decrypted = dec.output.recv().await.unwrap();
         dbg!(&decrypted);
         assert_eq!(decrypted.body, test_data);
     }

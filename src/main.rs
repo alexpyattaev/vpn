@@ -1,17 +1,17 @@
 mod crypto;
 mod framing;
 mod keepalive;
-use async_channel::bounded;
-use crypto::{crypto_decryptor, crypto_encryptor, decode_key_base64};
+mod util;
+use crypto::{decode_key_base64, CryptoMode, Decryptor, Encryptor};
 use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
-
 use counters::{watch_counters, COUNTERS};
 use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::atomic::AtomicU64,
 };
+use util::{flatten, merge};
 
 use tokio::{
     net::UdpSocket,
@@ -61,6 +61,10 @@ struct Args {
     // CHACHA20 nonce, base64 (RFC 4648) encoded, must be 12 bytes.
     #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2Cg=="))]
     nonce: String,
+
+    // Encryption mode. Sign only encrypts first 32 bytes of every packet to avoid injection of junk.
+    #[arg(short, long, default_value_t = CryptoMode::Encrypt, value_enum)]
+    crypto_mode: CryptoMode,
 }
 
 //use tracing::{span, Level};
@@ -73,14 +77,6 @@ use tracing::{debug, info, warn};
 //use hex_literal::hex;
 
 pub static TX_SEQUENCE_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
-
-async fn flatten<T>(handle: tokio::task::JoinHandle<Result<T>>) -> Result<T> {
-    match handle.await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(err)) => Err(err),
-        Err(err) => Err(eyre!("handling of future failed with error {}", err)),
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -141,10 +137,11 @@ async fn main() -> Result<()> {
 
     info!("TAP interface created, name: {}", tun.name());
     // Key and IV must be references to the `GenericArray` type.
-    let chachaparams = Arc::new(crypto::ChaChaParams {
+    let chachaparams = crypto::ChaChaParams {
         key: decode_key_base64(&args.key)?,
         nonce: decode_key_base64(&args.nonce)?,
-    });
+        mode: args.crypto_mode,
+    };
 
     let watch_counters = {
         let interval = tokio::time::interval_at(
@@ -153,52 +150,48 @@ async fn main() -> Result<()> {
         );
         flatten(tokio::spawn(watch_counters(interval)))
     };
-    //TODO have a pool of these around
-    let encryptor = {
-        let input_chan = bounded(64);
-        let output_chan = bounded(64);
-        let kp = chachaparams.clone();
-        let jh = tokio::task::spawn_blocking(move || {
-            crypto_encryptor(kp, input_chan.1, output_chan.0);
-            debug!("Crypto encryptor thread exited");
-        });
-        (input_chan.0, output_chan.1, jh)
+
+    let encryptor = Encryptor::new(chachaparams.clone());
+    let encryptors_jh = {
+        let a = (0..args.encoder_threads).map(|_| encryptor.spawn());
+        futures_util::future::join_all(a)
     };
-    let decryptor = {
-        let input_chan = bounded(64);
-        let output_chan = bounded(64);
-        let kp = chachaparams.clone();
-        let jh = tokio::task::spawn_blocking(move || {
-            crypto_decryptor(kp, input_chan.1, output_chan.0);
-            debug!("Crypto decryptor thread exited");
-        });
-        (input_chan.0, output_chan.1, jh)
+
+    let decryptor = Decryptor::new(chachaparams.clone());
+    let decryptors_jh = {
+        let a = (0..args.encoder_threads).map(|_| decryptor.spawn());
+        futures_util::future::join_all(a)
     };
+
     info!("Worker thread setup complete");
 
     let timeout_ticks = {
         let tick = Duration::from_millis(100);
         let timeout = Duration::from_millis(1000);
-        let s = encryptor.0.clone();
+        let s = encryptor.input.clone();
         flatten(tokio::spawn(keepalive::keepalive_ticks(tick, timeout, s)))
     };
     let udp_reader = flatten(tokio::spawn(read_udp(
         socket.clone(),
-        decryptor.0,
+        decryptor.input.clone(),
         args.udp_mtu,
     )));
 
     let udp_writer = flatten(tokio::spawn(feed_udp(
-        encryptor.1,
+        encryptor.output.clone(),
         socket.clone(),
         args.remote_address,
     )));
 
-    let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.0)));
+    let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.input.clone())));
 
-    let tap_writer = flatten(tokio::spawn(feed_tap(decryptor.1, tun.clone())));
+    let tap_writer = flatten(tokio::spawn(feed_tap(
+        decryptor.output.clone(),
+        tun.clone(),
+    )));
 
     info!("Init sequence completed, VPN ready");
+
     //Wait for any thread to quit
     tokio::try_join!(
         udp_reader,
@@ -207,6 +200,8 @@ async fn main() -> Result<()> {
         tap_writer,
         watch_counters,
         timeout_ticks,
+        merge(encryptors_jh),
+        merge(decryptors_jh),
     )
     .wrap_err("Fatal error in VPN operation, exiting")?;
 

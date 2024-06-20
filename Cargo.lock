@@ -1693,6 +1693,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "futures 0.3.30",
+ "futures-util",
  "itertools",
  "rand",
  "serde",
