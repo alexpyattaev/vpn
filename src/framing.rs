@@ -6,7 +6,7 @@ use bincode::{Decode, Encode};
 use bytes::{Bytes, BytesMut};
 use color_eyre::eyre::eyre;
 use color_eyre::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Encode, Decode, PartialEq, Debug)]
 pub enum MsgKind {
@@ -197,39 +197,48 @@ struct Pipeline {
     seq_first: u64,
     seq_last: Option<u64>,
     fragments: sorted_vec::SortedSet<Fragment>,
+    is_complete: bool,
 }
 
 impl Pipeline {
-    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<(u64, BytesMut)>> {
+    ///pushes a trusted message into the pipeline
+    pub fn add_msg(&mut self, m: TrustedMessage) -> Result<Option<u64>> {
         match m.inner_header.msgkind {
-            MsgKind::FirstFragment(o) => {
+            MsgKind::FirstFragment(len) => {
                 self.seq_first = m.outer_header.seq;
-                self.seq_last = Some(self.seq_first + o as u64);
+                self.seq_last = Some(self.seq_first + len as u64);
                 self.fragments.push(Fragment::from(m));
             }
-            MsgKind::Fragment(o) => {
+            MsgKind::Fragment(offset) => {
                 COUNTERS.fragments_rx.pkt(m.body.len());
-                let start_seq = m.outer_header.seq - o as u64;
+                let start_seq = m.outer_header.seq - offset as u64;
                 if self.fragments.is_empty() {
                     self.seq_first = start_seq;
                 } else if self.seq_first != start_seq {
-                    return Err(eyre!("Sequence mismatch"));
+                    unreachable!("This should not be possible if this is called correctly");
+                    //return Err(eyre!("Sequence mismatch"));
                 }
                 self.fragments.push(Fragment::from(m));
             }
             MsgKind::Keepalive => unreachable!(),
         }
+        self.check_complete();
         if self.is_complete() {
-            let mut res = BytesMut::new();
-            for p in self.fragments.iter() {
-                res.extend_from_slice(&p.bytes)
-            }
-            let rv = Ok(Some((self.seq_first, res)));
-            self.clear();
-            rv
+            Ok(Some(self.seq_first))
         } else {
             Ok(None)
         }
+    }
+
+    ///Extracts assembled frame from the pipeline
+    pub fn extract_and_clear(&mut self) -> BytesMut {
+        debug_assert!(self.is_complete());
+        let mut res = BytesMut::new();
+        for p in self.fragments.iter() {
+            res.extend_from_slice(&p.bytes)
+        }
+        self.clear();
+        res
     }
 
     pub fn clear(&mut self) {
@@ -240,10 +249,16 @@ impl Pipeline {
     pub fn is_empty(&self) -> bool {
         self.fragments.is_empty()
     }
-
     pub fn is_complete(&self) -> bool {
+        self.is_complete
+    }
+
+    pub fn check_complete(&mut self) {
         let seq_last = match self.seq_last {
-            None => return false,
+            None => {
+                self.is_complete = false;
+                return;
+            }
             Some(x) => x,
         };
 
@@ -254,18 +269,20 @@ impl Pipeline {
             }
             need_seq += f.bytes.len() as u64;
         }
-        need_seq == seq_last
+        self.is_complete = need_seq == seq_last;
     }
 }
 
 /// Reconstructs the frames sent from the peer. Keeps track of sequence numbers and fragmentation.
 pub struct Reassembler<const N: usize> {
+    seq_assembled: u64,
     pipelines: [Pipeline; N],
 }
 
 impl<const N: usize> Reassembler<N> {
-    pub fn new() -> Self {
+    pub fn new(init_seq: u64) -> Self {
         Reassembler {
+            seq_assembled: init_seq,
             pipelines: std::array::from_fn(|_| Default::default()),
         }
     }
@@ -277,19 +294,50 @@ impl<const N: usize> Reassembler<N> {
             MsgKind::Keepalive => unreachable!(),
         };
 
-        //Look for non-empty pipelines first
+        if let Some((idx, seq)) = self.add_frag(first_seq, m)? {
+            // deal with having a fully assembled frame ready to go
+            if seq < self.seq_assembled {
+                //TODO: deal with this securely somehow
+                warn!("Decoded packet with sequence number below current sequence number, assuming peer reset");
+                self.seq_assembled = seq;
+            }
+            //safe to release the packet
+            if seq == self.seq_assembled {
+                let msg = self.pipelines[idx].extract_and_clear();
+                self.seq_assembled += msg.len() as u64;
+                return Ok(Some((seq, msg)));
+            }
+        }
+        Ok(None)
+    }
+
+    // check if any pipelines have packets that can be released
+    pub fn poll(&mut self) -> Option<(u64, BytesMut)> {
         for pl in self.pipelines.iter_mut() {
+            if pl.is_complete() && pl.seq_first == self.seq_assembled {
+                let msg = pl.extract_and_clear();
+                self.seq_assembled += msg.len() as u64;
+                return Some((pl.seq_first, msg));
+            }
+        }
+        None
+    }
+
+    fn add_frag(&mut self, first_seq: u64, m: TrustedMessage) -> Result<Option<(usize, u64)>> {
+        //Look for non-empty pipelines first
+        for (idx, pl) in self.pipelines.iter_mut().enumerate() {
             if !pl.is_empty() && pl.seq_first == first_seq {
-                return pl.add_msg(m);
+                let rv = pl.add_msg(m)?;
+                return Ok(rv.map(|seq| (idx, seq)));
             }
         }
         //Look for any empty pipeline
-        for pl in self.pipelines.iter_mut() {
+        for (idx, pl) in self.pipelines.iter_mut().enumerate() {
             if pl.is_empty() {
-                return pl.add_msg(m);
+                let rv = pl.add_msg(m)?;
+                return Ok(rv.map(|seq| (idx, seq)));
             }
         }
-
         Err(eyre!("No pipeline for reassembly found!"))
     }
     pub fn check_stale(&mut self, seq_min: u64) {
@@ -302,6 +350,7 @@ impl<const N: usize> Reassembler<N> {
                 pl.clear();
             }
         }
+        self.seq_assembled = seq_min;
     }
 }
 
@@ -313,16 +362,17 @@ mod tests {
     use rand::prelude::*;
 
     #[test]
-    fn fragmented_packets() -> Result<()> {
+    fn fragmented_packet() -> Result<()> {
         let mtu = 10;
         let initial_seq = 42;
         for n in [9, 10, 12, 20, 21, 30, 35] {
             let seq = AtomicU64::new(initial_seq);
             let test_data = BytesMut::from_iter(('a' as u8..='z' as u8).cycle().take(n));
             let mut fragmenter = PacketFragmenter::new(test_data.clone(), mtu, &seq);
-            let mut assembler = Reassembler::<5>::new();
+            let mut assembler = Reassembler::<5>::new(initial_seq);
             let (rs, assembled) = loop {
                 let m = fragmenter.next().unwrap();
+                println!("Formed fragment {:?}", &m);
                 match assembler.add_msg(m) {
                     Ok(Some(m)) => break m,
                     Ok(None) => {
@@ -345,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_fragmented_packets() -> Result<()> {
+    fn out_of_order_fragmented() -> Result<()> {
         let mtu = 10;
         let initial_seq = 42;
 
@@ -363,7 +413,7 @@ mod tests {
                 fragments.shuffle(&mut rng);
             }
 
-            let mut assembler = Reassembler::<4>::new();
+            let mut assembler = Reassembler::<4>::new(initial_seq);
             let mut assembled = vec![];
             for f in fragments {
                 match assembler.add_msg(f) {
@@ -374,7 +424,13 @@ mod tests {
                     Err(e) => return Err(e),
                 }
             }
-            assembled.sort();
+            loop {
+                match assembler.poll() {
+                    Some(msg) => assembled.push(msg),
+                    None => break,
+                }
+            }
+            dbg!(&assembled);
             for (rx, tx) in assembled.iter().zip([test_data1, test_data2]) {
                 assert_eq!(tx, rx.1, "mismatch at seq {}", rx.0);
             }

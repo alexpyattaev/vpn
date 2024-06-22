@@ -333,7 +333,7 @@ async fn read_udp(
 async fn feed_tap(input: async_channel::Receiver<TrustedMessage>, tun: Arc<Tun>) -> Result<()> {
     // max amount of bytes for possible packet reorderings
     let max_lookback_seq = 5000;
-    let mut assembler = Reassembler::<8>::new();
+    let mut assembler = Reassembler::<8>::new(1);
     //Todo: move logic around rx_seq_max to reassembler
     let mut rx_seq_max = 0;
     loop {

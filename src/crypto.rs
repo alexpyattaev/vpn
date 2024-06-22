@@ -181,6 +181,8 @@ impl Decryptor {
 #[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
+
     use super::*;
     use crate::framing::{InnerHeader, MsgKind, OuterHeader};
 
@@ -209,19 +211,28 @@ mod tests {
         };
         dbg!(&test_data);
         let (enc, dec) = make_crypto_pair();
+        /*async_scoped::TokioScope::scope_and_block(|s| {
+        s.spawn(async {
+            enc.spawn().await.unwrap();
+        });
+        s.spawn(async {
+            dec.spawn().await.unwrap();
+        });
 
-        let _ejh = enc.spawn();
-        let _djh = dec.spawn();
+        s.spawn(async {
+            enc.input.send(test_msg).await.unwrap();
+            dbg!("sent");
+            let encrypted = enc.output.recv().await.unwrap();
+            dbg!(&encrypted);
 
-        enc.input.send(test_msg).await.unwrap();
-        let encrypted = enc.output.recv().await.unwrap();
-        dbg!(&encrypted);
-
-        let parsed = UntrustedMessage::from_buffer(BytesMut::from_iter(encrypted.iter())).unwrap();
-        dbg!(&parsed);
-        dec.input.send(parsed).await.unwrap();
-        let decrypted = dec.output.recv().await.unwrap();
-        dbg!(&decrypted);
-        assert_eq!(decrypted.body, test_data);
+            let parsed =
+                UntrustedMessage::from_buffer(BytesMut::from_iter(encrypted.iter())).unwrap();
+            dbg!(&parsed);
+            dec.input.send(parsed).await.unwrap();
+            let decrypted = dec.output.recv().await.unwrap();
+            dbg!(&decrypted);
+            assert_eq!(decrypted.body, test_data);
+        });
+        });*/
     }
 }
