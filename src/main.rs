@@ -5,18 +5,18 @@ mod util;
 use crypto::{decode_key_base64, CryptoMode, Decryptor, Encryptor};
 use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
+mod selfcheck;
+mod traits;
 use counters::{watch_counters, COUNTERS};
 use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::atomic::AtomicU64,
 };
+use traits::{ExtranetPacketInterface, IntranetPacketInterface};
 use util::{flatten, merge};
 
-use tokio::{
-    net::UdpSocket,
-    time::{Duration, Instant},
-};
+use tokio::time::{Duration, Instant};
 
 // use tun_tap::{Iface, Mode};
 //use tun_tap::r#async::Async;
@@ -29,7 +29,15 @@ use color_eyre::{
     eyre::{eyre, Context, Report},
     Result,
 };
+
+#[cfg(not(feature = "bench_loopback"))]
+use tokio::net::UdpSocket;
+#[cfg(not(feature = "bench_loopback"))]
 use tokio_tun::Tun;
+
+#[cfg(feature = "bench_loopback")]
+use selfcheck::{TrafGen, WireEmulator};
+
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -68,7 +76,7 @@ struct Args {
 }
 
 //use tracing::{span, Level};
-use tracing_attributes::instrument;
+//use tracing_attributes::instrument;
 //TODO: https://crates.io/crates/tracing-coz or https://crates.io/crates/tracing-tracy
 
 use tracing::{debug, info, warn};
@@ -110,32 +118,54 @@ async fn main() -> Result<()> {
     debug!("Arguments are {:?}", &args);
 
     let socket = {
-        let s = UdpSocket::bind(args.local_address)
-            .await
-            .wrap_err_with(|| format!("Can not bind to local address {}", args.local_address))?;
-        info!("UDP local bind successful");
-        s.connect(args.remote_address).await.wrap_err_with(|| {
-            format!(
-                "Can not find path to remote address {}",
-                args.remote_address
-            )
-        })?;
+        #[cfg(feature = "bench_loopback")]
+        let s = {
+            info!("UDP emulation enabled");
+            WireEmulator::new(32)
+        };
+
+        #[cfg(not(feature = "bench_loopback"))]
+        let s = {
+            let s = UdpSocket::bind(args.local_address)
+                .await
+                .wrap_err_with(|| {
+                    format!("Can not bind to local address {}", args.local_address)
+                })?;
+            info!("UDP local bind successful");
+            s.connect(args.remote_address).await.wrap_err_with(|| {
+                format!(
+                    "Can not find path to remote address {}",
+                    args.remote_address
+                )
+            })?;
+            info!("UDP route check successful");
+            s
+        };
         Arc::new(s)
     };
-    info!("UDP route check successful");
+    let tun = {
+        #[cfg(feature = "bench_loopback")]
+        let a = {
+            debug!("Setting up traffic generation interface");
+            TrafGen::new(1500)
+        };
 
-    debug!("Setting up TAP interface");
-    let tun = Arc::new(
-        Tun::builder()
-            .name("") // if name is empty, then it is set by kernel.
-            .tap(true) // false (default): TUN, true: TAP.
-            .packet_info(false) // false: IFF_NO_PI, default is true.
-            .up() // or set it up manually using `sudo ip link set <tun-name> up`.
-            .try_build() // or `.try_build_mq(queues)` for multi-queue support.
-            .wrap_err("Could not register TAP interface, are you root?")?,
-    );
+        #[cfg(not(feature = "bench_loopback"))]
+        let a = {
+            debug!("Setting up TAP interface");
+            let a = Tun::builder()
+                .name("") // if name is empty, then it is set by kernel.
+                .tap(true) // false (default): TUN, true: TAP.
+                .packet_info(false) // false: IFF_NO_PI, default is true.
+                .up() // or set it up manually using `sudo ip link set <tun-name> up`.
+                .try_build() // or `.try_build_mq(queues)` for multi-queue support.
+                .wrap_err("Could not register TAP interface, are you root?")?;
+            info!("TAP interface created, name: {}", a.name());
+            a
+        };
+        Arc::new(a)
+    };
 
-    info!("TAP interface created, name: {}", tun.name());
     // Key and IV must be references to the `GenericArray` type.
 
     let chachaparams = {
@@ -223,15 +253,15 @@ fn bytes_mut_uninit(size: usize) -> BytesMut {
     buf
 }
 
-#[instrument(skip(tun, output))]
-async fn read_tap(tun: Arc<Tun>, output: async_channel::Sender<TrustedMessage>) -> Result<()> {
+//#[instrument(skip(tun, output))]
+
+async fn read_tap(
+    tun: Arc<impl traits::IntranetPacketInterface>,
+    output: async_channel::Sender<TrustedMessage>,
+) -> Result<()> {
     loop {
         let mut buf = bytes_mut_uninit(1800);
-
-        let n = match cfg!(feature = "bench_tap_rx") {
-            true => 1500,
-            false => tun.recv(&mut buf).await?,
-        };
+        let n = tun.recv(&mut buf).await?;
         //SAFETY this is okay since we've just read exactly that many bytes,
         //recv can not write past end of buffer,
         //and we do not trust this data anyway;
@@ -264,10 +294,10 @@ async fn read_tap(tun: Arc<Tun>, output: async_channel::Sender<TrustedMessage>) 
     }
 }
 
-#[instrument(skip(input, udp, peer))]
+//#[instrument(skip(input, udp, peer))]
 async fn feed_udp(
     input: async_channel::Receiver<Bytes>,
-    udp: Arc<UdpSocket>,
+    udp: Arc<impl ExtranetPacketInterface>,
     peer: SocketAddr,
 ) -> Result<()> {
     loop {
@@ -277,38 +307,33 @@ async fn feed_udp(
         if cfg!(feature = "packet_tracing") {
             debug!("feeding {} bytes to UDP peer {:?}", b.len(), &peer);
         }
-        if cfg!(not(feature = "bench_tap_rx")) {
-            let sent = match udp.send(&b).await {
-                Ok(s) => s,
-                Err(e) => match e.kind() {
-                    ErrorKind::ConnectionRefused | ErrorKind::Interrupted => continue,
-                    _ => return Err(Report::new(e).wrap_err("UDP send encountered a fatal error")),
-                },
-            };
-            if b.len() != sent {
-                return Err(eyre!(
-                    "UDP send could not send the whole frame, check your MTU config"
-                ));
-            }
+        let sent = match udp.send(&b).await {
+            Ok(s) => s,
+            Err(e) => match e.kind() {
+                ErrorKind::ConnectionRefused | ErrorKind::Interrupted => continue,
+                _ => return Err(Report::new(e).wrap_err("UDP send encountered a fatal error")),
+            },
+        };
+        if b.len() != sent {
+            return Err(eyre!(
+                "UDP send could not send the whole frame, check your MTU config"
+            ));
         }
     }
 }
 
 //#[instrument(skip(output, udp, mtu))]
 async fn read_udp(
-    udp: Arc<UdpSocket>,
+    udp: Arc<impl ExtranetPacketInterface>,
     output: async_channel::Sender<UntrustedMessage>,
     mtu: usize,
 ) -> Result<()> {
     loop {
-        let buf = match cfg!(feature = "bench_udp_rx") {
-            true => bytes_mut_uninit(mtu),
-            false => {
-                let mut buf = bytes_mut_uninit(mtu);
-                let n = udp.recv(buf.as_mut()).await?;
-                buf.truncate(n);
-                buf
-            }
+        let buf = {
+            let mut buf = bytes_mut_uninit(mtu);
+            let n = udp.recv(buf.as_mut()).await?;
+            buf.truncate(n);
+            buf
         };
         let len = buf.len();
 
@@ -330,7 +355,10 @@ async fn read_udp(
 }
 
 //#[instrument(skip(input, tun))]
-async fn feed_tap(input: async_channel::Receiver<TrustedMessage>, tun: Arc<Tun>) -> Result<()> {
+async fn feed_tap(
+    input: async_channel::Receiver<TrustedMessage>,
+    tun: Arc<impl IntranetPacketInterface>,
+) -> Result<()> {
     // max amount of bytes for possible packet reorderings
     let max_lookback_seq = 5000;
     let mut assembler = Reassembler::<8>::new(1);

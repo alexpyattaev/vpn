@@ -45,7 +45,8 @@ pub async fn keepalive_ticks(
             sender
                 .send(TrustedMessage {
                     outer_header: OuterHeader {
-                        seq: crate::TX_SEQUENCE_ALLOCATOR.fetch_add(1, Ordering::SeqCst),
+                        //seq: crate::TX_SEQUENCE_ALLOCATOR.fetch_add(1, Ordering::SeqCst),
+                        seq: crate::TX_SEQUENCE_ALLOCATOR.load(Ordering::SeqCst),
                     },
                     inner_header: InnerHeader {
                         msgkind: MsgKind::Keepalive,

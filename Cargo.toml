@@ -27,11 +27,12 @@ tracing = { version = "0.1.40", features = ["async-await"] }
 tracing-appender = "0.2.3"
 tracing-attributes = { version = "0.1.27", features = ["async-await"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
+trait-variant = "0.1.2"
 tun-tap = "0.1.4"
 
 [features]
 default = []
-bench_tap_rx = []
-bench_udp_rx = []
+# makes a bunch of fake packets, and seds them through encryption and decryption chains, checks integrity and sequence of received stream
+bench_loopback = []
 packet_tracing = []
-bench = ["bench_tap_rx", "bench_udp_rx"]
+bench = ["bench_loopback"]
