@@ -8,10 +8,11 @@ mod counters;
 mod selfcheck;
 mod traits;
 use counters::{watch_counters, COUNTERS};
+use keepalive::CURRENT_PACKET_TIME;
 use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicU64, Ordering},
 };
 use traits::{ExtranetPacketInterface, IntranetPacketInterface};
 use util::{flatten, merge};
@@ -55,11 +56,11 @@ struct Args {
     udp_mtu: usize,
 
     /// Number of encoder threads for encryption of packets
-    #[arg(short, long, default_value_t = 3)]
+    #[arg(short, long, default_value_t = 1)]
     encoder_threads: usize,
 
     /// Number of decoder threads for decrpytion of packets
-    #[arg(short, long, default_value_t = 3)]
+    #[arg(short, long, default_value_t = 2)]
     decoder_threads: usize,
 
     // Encryption key, base64 (RFC 4648) encoded, must be 32 bytes long.
@@ -117,11 +118,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     debug!("Arguments are {:?}", &args);
 
+    if args.encoder_threads > 1 {
+        panic!("Parallel encoding is broken and not supported");
+    }
     let socket = {
         #[cfg(feature = "bench_loopback")]
         let s = {
             info!("UDP emulation enabled");
-            WireEmulator::new(32)
+            WireEmulator::new(8)
         };
 
         #[cfg(not(feature = "bench_loopback"))]
@@ -359,36 +363,30 @@ async fn feed_tap(
     input: async_channel::Receiver<TrustedMessage>,
     tun: Arc<impl IntranetPacketInterface>,
 ) -> Result<()> {
-    // max amount of bytes for possible packet reorderings
-    let max_lookback_seq = 5000;
-    let mut assembler = Reassembler::<8>::new(1);
-    //Todo: move logic around rx_seq_max to reassembler
-    let mut rx_seq_max = 0;
+    // time to wait in ticks for reordered packets.
+    let max_lookback_ticks = 2;
+    let mut assembler = Reassembler::<32>::new(1);
     loop {
         let pkt = input
             .recv()
             .await
             .wrap_err("No more data for TAP availabe")?;
 
-        rx_seq_max = rx_seq_max.max(pkt.outer_header.seq);
-
-        if pkt.outer_header.seq < rx_seq_max {
-            let d = rx_seq_max - pkt.outer_header.seq;
-            if d > max_lookback_seq {
-                warn!(
-                    "Got stale packet with seq {}, relevant seq {}, dropping",
-                    pkt.outer_header.seq, rx_seq_max
-                );
-            }
+        if pkt.outer_header.seq < assembler.min_seq() {
+            warn!(
+                "Got stale packet with stale seq {}, relevant seq {} dropping",
+                pkt.outer_header.seq,
+                assembler.min_seq()
+            );
+            COUNTERS.seq_invalid.pkt(pkt.body.len());
         }
 
         keepalive::packet_rx();
-        let pkt = match pkt.inner_header.msgkind {
+        match pkt.inner_header.msgkind {
             framing::MsgKind::Keepalive => {
                 if cfg!(feature = "packet_tracing") {
                     debug!("Got keepalive");
                 }
-                continue;
             }
             _ => {
                 if cfg!(feature = "packet_tracing") {
@@ -399,25 +397,30 @@ async fn feed_tap(
                         if cfg!(feature = "packet_tracing") {
                             debug!("Not enough to assemble full packet");
                         }
-                        continue;
                     }
-                    Ok(Some((s, p))) => {
-                        if cfg!(feature = "packet_tracing") {
-                            debug!("Assembled packet with seq {} length {}", s, p.len());
+                    Ok(Some(_)) => {
+                        while let Some((s, p)) = assembler.poll() {
+                            let n = tun.send(&p).await?;
+                            COUNTERS.tap_tx.pkt(n);
+                            if cfg!(feature = "packet_tracing") {
+                                debug!("Assembled packet with seq {} length {}", s, p.len());
+                            }
                         }
-                        p
                     }
                     Err(e) => {
                         warn!("Reassembly failed with error {e}");
-                        continue;
                     }
                 }
             }
-        };
+        }
 
-        let n = tun.send(&pkt).await?;
-        COUNTERS.tap_tx.pkt(n);
-        // prevent junk from accumulating in reassembly buffer
-        assembler.check_stale(rx_seq_max - max_lookback_seq);
+        if cfg!(not(feature = "packet_tracing")) {
+            //TODO: make this run on independent timer/thread
+            // prevent junk from accumulating in reassembly buffer
+            let cpt = CURRENT_PACKET_TIME.load(Ordering::SeqCst);
+            if cpt > max_lookback_ticks {
+                assembler.check_stale(cpt - max_lookback_ticks);
+            }
+        }
     }
 }

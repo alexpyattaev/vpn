@@ -80,6 +80,7 @@ pub struct CountersAll {
     pub udp_tx: Counters,
 
     pub udp_invalid: Counters,
+    pub seq_invalid: Counters,
 
     pub fragments_tx: Counters,
     pub fragments_rx: Counters,
@@ -95,6 +96,7 @@ impl CountersAll {
             tap_rx: Counters::new(),
             udp_rx: Counters::new(),
             udp_invalid: Counters::new(),
+            seq_invalid: Counters::new(),
             fragments_tx: Counters::new(),
             fragments_rx: Counters::new(),
         }
@@ -116,11 +118,15 @@ UDP TX {}
 UDP RX {}
 TAP TX {}
 TAP RX {}
+UDP INVALID {}
+SEQ INVALID {}
 ",
             self.udp_tx.prep_display(elapsed),
             self.udp_rx.prep_display(elapsed),
             self.tap_tx.prep_display(elapsed),
-            self.tap_rx.prep_display(elapsed)
+            self.tap_rx.prep_display(elapsed),
+            self.udp_invalid.prep_display(elapsed),
+            self.seq_invalid.prep_display(elapsed),
         );
         f.write_all(s.as_bytes()).await?;
 
