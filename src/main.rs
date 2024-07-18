@@ -2,7 +2,7 @@ mod crypto;
 mod framing;
 mod keepalive;
 mod util;
-use crypto::{decode_key_base64, CryptoMode, Decryptor, Encryptor};
+use crypto::{decode_key_base64, CryptoMode, Decryptor, Encryptor, EncryptorPool};
 use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
 mod selfcheck;
@@ -12,6 +12,7 @@ use keepalive::CURRENT_PACKET_TIME;
 use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::atomic::{AtomicU64, Ordering},
 };
 use traits::{ExtranetPacketInterface, IntranetPacketInterface};
@@ -56,12 +57,12 @@ struct Args {
     udp_mtu: usize,
 
     /// Number of encoder threads for encryption of packets
-    #[arg(short, long, default_value_t = 1)]
-    encoder_threads: usize,
+    #[arg(short, long, default_value_t = NonZeroUsize::new(2).unwrap())]
+    encoder_threads: NonZeroUsize,
 
     /// Number of decoder threads for decrpytion of packets
-    #[arg(short, long, default_value_t = 2)]
-    decoder_threads: usize,
+    #[arg(short, long, default_value_t = NonZeroUsize::new(2).unwrap())]
+    decoder_threads: NonZeroUsize,
 
     // Encryption key, base64 (RFC 4648) encoded, must be 32 bytes long.
     #[arg(short, long, default_value_t = String::from("MDEwMjAzMDQwNTA2MDcwODA5MTAxMTEyMTMxNDE1MTY="))]
@@ -118,9 +119,6 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     debug!("Arguments are {:?}", &args);
 
-    if args.encoder_threads > 1 {
-        panic!("Parallel encoding is broken and not supported");
-    }
     let socket = {
         #[cfg(feature = "bench_loopback")]
         let s = {
@@ -151,7 +149,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "bench_loopback")]
         let a = {
             debug!("Setting up traffic generation interface");
-            TrafGen::new(1500)
+            TrafGen::new(1500, 16)
         };
 
         #[cfg(not(feature = "bench_loopback"))]
@@ -190,24 +188,25 @@ async fn main() -> Result<()> {
         flatten(tokio::spawn(watch_counters(interval)))
     };
 
-    let encryptor = Encryptor::new(chachaparams.clone());
-    let encryptors_jh = {
-        let a = (0..args.encoder_threads).map(|_| encryptor.spawn());
-        futures_util::future::join_all(a)
-    };
-
-    let decryptor = Decryptor::new(chachaparams.clone());
-    let decryptors_jh = {
-        let a = (0..args.encoder_threads).map(|_| decryptor.spawn());
-        futures_util::future::join_all(a)
-    };
+    /*    let (encryptor, encryptors_jh) = {
+            let mut encryptor = Encryptor::new(chachaparams.clone());
+            let encryptors_jh = {
+                let a = (0..args.encoder_threads).map(|_| encryptor.spawn());
+                futures_util::future::join_all(a)
+            };
+            (encryptor, encryptors_jh)
+        };
+    */
+    let encryptor_pool = EncryptorPool::new(chachaparams.clone(), args.encoder_threads);
+    let encryptor = encryptor_pool.encryptor.clone();
+    let decryptor = Decryptor::new(chachaparams.clone(), args.decoder_threads);
 
     info!("Worker thread setup complete");
 
     let timeout_ticks = {
         let tick = Duration::from_millis(100);
         let timeout = Duration::from_millis(1000);
-        let s = encryptor.input.clone();
+        let s = encryptor.clone();
         flatten(tokio::spawn(keepalive::keepalive_ticks(tick, timeout, s)))
     };
     let udp_reader = flatten(tokio::spawn(read_udp(
@@ -217,12 +216,12 @@ async fn main() -> Result<()> {
     )));
 
     let udp_writer = flatten(tokio::spawn(feed_udp(
-        encryptor.output.clone(),
+        encryptor.clone(),
         socket.clone(),
         args.remote_address,
     )));
 
-    let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.input.clone())));
+    let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.clone())));
 
     let tap_writer = flatten(tokio::spawn(feed_tap(
         decryptor.output.clone(),
@@ -239,8 +238,6 @@ async fn main() -> Result<()> {
         tap_writer,
         watch_counters,
         timeout_ticks,
-        merge(encryptors_jh),
-        merge(decryptors_jh),
     )
     .wrap_err("Fatal error in VPN operation, exiting")?;
 
@@ -259,10 +256,7 @@ fn bytes_mut_uninit(size: usize) -> BytesMut {
 
 //#[instrument(skip(tun, output))]
 
-async fn read_tap(
-    tun: Arc<impl traits::IntranetPacketInterface>,
-    output: async_channel::Sender<TrustedMessage>,
-) -> Result<()> {
+async fn read_tap(tun: Arc<impl traits::IntranetPacketInterface>, output: Encryptor) -> Result<()> {
     loop {
         let mut buf = bytes_mut_uninit(1800);
         let n = tun.recv(&mut buf).await?;
@@ -285,7 +279,7 @@ async fn read_tap(
             );
         }
         for f in pf {
-            output.send(f).await?;
+            output.encrypt(f).await?;
         }
         /*
         // block pipe for needed number of messages (to avoid re-syncing for each)
@@ -300,12 +294,12 @@ async fn read_tap(
 
 //#[instrument(skip(input, udp, peer))]
 async fn feed_udp(
-    input: async_channel::Receiver<Bytes>,
+    input: Encryptor,
     udp: Arc<impl ExtranetPacketInterface>,
     peer: SocketAddr,
 ) -> Result<()> {
     loop {
-        let b = input.recv().await.wrap_err("Peer disconnected")?;
+        let b = input.get_ready_pkt().await.wrap_err("Peer disconnected")?;
         COUNTERS.udp_tx.pkt(b.len());
         keepalive::packet_tx();
         if cfg!(feature = "packet_tracing") {

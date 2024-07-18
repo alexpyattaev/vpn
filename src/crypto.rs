@@ -1,10 +1,12 @@
 use crate::framing::{TrustedMessage, UntrustedMessage};
-use crate::util::flatten;
 use async_channel::{bounded, Receiver, Sender};
 use bytes::{Bytes, BytesMut};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 use color_eyre::eyre::{eyre, Context, Result};
+use std::num::{NonZeroU8, NonZeroUsize};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub fn decode_key_base64<const N: usize>(input: &str) -> Result<[u8; N]> {
     use base64::prelude::BASE64_STANDARD;
@@ -41,31 +43,123 @@ pub struct ChaChaParams {
     pub mode: CryptoMode,
 }
 
-pub struct Encryptor {
-    params: ChaChaParams,
-    pub input: Sender<TrustedMessage>,
-    pub output: Receiver<Bytes>,
-    worker_input: Receiver<TrustedMessage>,
-    worker_output: Sender<Bytes>,
+struct EncWorkerChannels {
+    input_tx: Sender<TrustedMessage>,
+    output_rx: Receiver<Bytes>,
 }
+
+struct DecWorkerChannels {
+    input_tx: Sender<UntrustedMessage>,
+    output_rx: Receiver<TrustedMessage>,
+}
+
+struct EncryptorInner {
+    worker_channels: Vec<EncWorkerChannels>,
+    chan_in_idx: AtomicUsize,
+    chan_out_idx: AtomicUsize,
+}
+
+#[derive(Clone)]
+pub struct Encryptor {
+    inner: Arc<EncryptorInner>,
+}
+
 impl Encryptor {
-    pub fn new(params: ChaChaParams) -> Self {
-        let input_chan = bounded(64);
-        let output_chan = bounded(64);
+    pub async fn encrypt(&self, msg: TrustedMessage) -> Result<()> {
+        let c = self.inner.chan_in_idx.fetch_add(1, Ordering::SeqCst);
+        let c = c % self.inner.worker_channels.len();
+        //println!("Sending pkt to thread {c}");
+        self.inner.worker_channels[c].input_tx.send(msg).await?;
+        Ok(())
+    }
+
+    pub async fn get_ready_pkt(&self) -> Result<Bytes> {
+        let c = self.inner.chan_out_idx.fetch_add(1, Ordering::SeqCst);
+        let c = c % self.inner.worker_channels.len();
+        //println!("Fetching pkt from thread {c}");
+        Ok(self.inner.worker_channels[c].output_rx.recv().await?)
+    }
+}
+
+pub struct EncryptorPool {
+    pub encryptor: Encryptor,
+    workers: Vec<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl Drop for EncryptorPool {
+    fn drop(&mut self) {
+        for wc in self.encryptor.inner.worker_channels.iter() {
+            wc.input_tx.close();
+            wc.output_rx.close();
+        }
+
+        for w in self.workers.drain(..) {
+            let r = w
+                .join()
+                .expect("Encryptor thread panicked please report bug");
+            if let Err(m) = r {
+                tracing::error!("Thread crashed with error {m}");
+            }
+        }
+    }
+}
+
+//TODO: deal with thread limits gracefully
+impl EncryptorPool {
+    pub fn new(params: ChaChaParams, num_threads: NonZeroUsize) -> Self {
+        let mut worker_channels = Vec::with_capacity(num_threads.get());
+        let mut workers = Vec::with_capacity(num_threads.get());
+        for _ in 0..num_threads.get() {
+            let input_chan = bounded(1);
+            let output_chan = bounded(1);
+            let wc = EncWorkerChannels {
+                input_tx: input_chan.0,
+                output_rx: output_chan.1,
+            };
+            worker_channels.push(wc);
+            let p = params.clone();
+            let jh = std::thread::spawn(|| Self::work(p, input_chan.1, output_chan.0));
+            workers.push(jh);
+        }
+
         Self {
-            params,
-            input: input_chan.0,
-            output: output_chan.1,
-            worker_input: input_chan.1,
-            worker_output: output_chan.0,
+            workers,
+            encryptor: Encryptor {
+                inner: Arc::new(EncryptorInner {
+                    chan_in_idx: AtomicUsize::new(0),
+                    chan_out_idx: AtomicUsize::new(0),
+                    worker_channels,
+                }),
+            },
         }
     }
 
-    pub async fn spawn(&self) -> Result<()> {
-        let i = self.worker_input.clone();
-        let o = self.worker_output.clone();
-        let p = self.params.clone();
-        flatten(tokio::task::spawn_blocking(move || Self::work(p, i, o))).await
+    async fn watch_threads(mut self) -> Result<()> {
+        'outer: loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            for wt in self.workers.iter_mut() {
+                if wt.is_finished() {
+                    break 'outer;
+                }
+            }
+        }
+        for wc in self.encryptor.inner.worker_channels.iter() {
+            wc.input_tx.close();
+            wc.output_rx.close();
+        }
+
+        for wt in self.workers.drain(..) {
+            match wt.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("{e}");
+                }
+                Err(e) => {
+                    tracing::error!("e");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn work(
@@ -115,29 +209,44 @@ fn apply_keystream_partial<const N: usize>(b: &mut [u8], c: &mut ChaCha20) {
 }
 
 pub struct Decryptor {
-    params: ChaChaParams,
     pub input: Sender<UntrustedMessage>,
     pub output: Receiver<TrustedMessage>,
     pub worker_input: Receiver<UntrustedMessage>,
     pub worker_output: Sender<TrustedMessage>,
+    workers: Vec<std::thread::JoinHandle<Result<()>>>,
 }
+impl Drop for Decryptor {
+    fn drop(&mut self) {
+        for w in self.workers.drain(..) {
+            let r = w
+                .join()
+                .expect("Decryptor thread panicked please report bug");
+            if let Err(m) = r {
+                tracing::error!("Thread crashed with error {m}");
+            }
+        }
+    }
+}
+
 impl Decryptor {
-    pub fn new(params: ChaChaParams) -> Self {
-        let input_chan = bounded(64);
-        let output_chan = bounded(64);
-        Self {
-            params,
+    pub fn new(params: ChaChaParams, num_threads: NonZeroUsize) -> Self {
+        let input_chan = bounded(num_threads.get());
+        let output_chan = bounded(num_threads.get());
+        let mut s = Self {
             input: input_chan.0,
             output: output_chan.1,
             worker_input: input_chan.1,
             worker_output: output_chan.0,
+            workers: Vec::new(),
+        };
+        for _ in 0..num_threads.get() {
+            let i = s.worker_input.clone();
+            let o = s.worker_output.clone();
+            let p = params.clone();
+            let jh = std::thread::spawn(|| Self::work(p, i, o));
+            s.workers.push(jh);
         }
-    }
-    pub async fn spawn(&self) -> Result<()> {
-        let i = self.worker_input.clone();
-        let o = self.worker_output.clone();
-        let p = self.params.clone();
-        flatten(tokio::task::spawn_blocking(move || Self::work(p, i, o))).await
+        s
     }
 
     fn work(
@@ -186,17 +295,12 @@ mod tests {
     use super::*;
     use crate::framing::{InnerHeader, MsgKind, OuterHeader};
 
-    fn make_crypto_pair() -> (Encryptor, Decryptor) {
-        let params = ChaChaParams {
+    fn make_bogus_params() -> ChaChaParams {
+        ChaChaParams {
             key: [0x42; 32],
             nonce: [0x42; 12],
             mode: CryptoMode::Encrypt,
-        };
-
-        (
-            Encryptor::new(params.clone()),
-            Decryptor::new(params.clone()),
-        )
+        }
     }
 
     #[tokio::test]
@@ -210,7 +314,12 @@ mod tests {
             body: test_data.clone(),
         };
         dbg!(&test_data);
-        let (enc, dec) = make_crypto_pair();
+        let params = make_bogus_params();
+
+        let encpool = EncryptorPool::new(params.clone(), 1);
+        let enc = encpool.encryptor.clone();
+        let dec = Decryptor::new(params.clone(), 1);
+
         /*async_scoped::TokioScope::scope_and_block(|s| {
         s.spawn(async {
             enc.spawn().await.unwrap();

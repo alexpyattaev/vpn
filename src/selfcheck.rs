@@ -6,14 +6,16 @@ use crate::traits::{ExtranetPacketInterface, IntranetPacketInterface};
 use bytes::Bytes;
 pub struct TrafGen {
     pub packet_size: usize,
+    pub max_backlog: usize,
     pub seq_sent: AtomicU64,
     pub seq_recv: AtomicU64,
 }
 
 impl TrafGen {
-    pub fn new(packet_size: usize) -> Self {
+    pub fn new(packet_size: usize, max_backlog: usize) -> Self {
         Self {
             packet_size,
+            max_backlog,
             seq_recv: AtomicU64::new(0),
             seq_sent: AtomicU64::new(0),
         }
@@ -33,6 +35,15 @@ impl IntranetPacketInterface for TrafGen {
             buf.len() > self.packet_size,
             "Insufficient buffer for packet size specified"
         );
+        let rx_seq = self.seq_recv.load(Ordering::SeqCst);
+        if seq < rx_seq {
+            panic!("WAT");
+        }
+
+        if seq - rx_seq > (self.packet_size * self.max_backlog) as u64 {
+            //tokio::task::yield_now().await;
+            tokio::time::sleep(tokio::time::Duration::from_nanos(100)).await;
+        }
         /*if seq > self.packet_size as u64 * 10000 {
         panic!("OMG");
         }*/

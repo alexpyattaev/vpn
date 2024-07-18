@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 
+use crate::crypto::Encryptor;
 use crate::framing::{InnerHeader, MsgKind};
 use crate::framing::{OuterHeader, TrustedMessage};
 use tracing::{debug, error, info, warn};
@@ -25,7 +26,7 @@ pub static CONNECTION_BROKEN: AtomicBool = AtomicBool::new(false);
 pub async fn keepalive_ticks(
     tick: tokio::time::Duration,
     timeout: tokio::time::Duration,
-    sender: async_channel::Sender<TrustedMessage>,
+    sender: Encryptor,
 ) -> Result<()> {
     let start = Instant::now();
     let mut interval = tokio::time::interval_at(start, tick);
@@ -42,18 +43,18 @@ pub async fn keepalive_ticks(
                 "Sending keepalive packet, {} ms since last UDP tx",
                 since_last_tx * tick_ms
             );
-            sender
-                .send(TrustedMessage {
-                    outer_header: OuterHeader {
-                        //seq: crate::TX_SEQUENCE_ALLOCATOR.fetch_add(1, Ordering::SeqCst),
-                        seq: crate::TX_SEQUENCE_ALLOCATOR.load(Ordering::SeqCst),
-                    },
-                    inner_header: InnerHeader {
-                        msgkind: MsgKind::Keepalive,
-                    },
-                    body: BytesMut::new(),
-                })
-                .await?;
+            let msg = TrustedMessage {
+                outer_header: OuterHeader {
+                    //seq: crate::TX_SEQUENCE_ALLOCATOR.fetch_add(1, Ordering::SeqCst),
+                    seq: crate::TX_SEQUENCE_ALLOCATOR.load(Ordering::SeqCst),
+                },
+                inner_header: InnerHeader {
+                    msgkind: MsgKind::Keepalive,
+                },
+                body: BytesMut::new(),
+            };
+
+            sender.encrypt(msg).await?;
         }
 
         let since_last_rx = cur_time - LAST_RX_PACKET_TIME.load(Ordering::SeqCst);

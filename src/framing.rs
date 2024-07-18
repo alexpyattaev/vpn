@@ -390,6 +390,8 @@ impl<const N: usize> Reassembler<N> {
             return pl.add_msg(m);
         }
         error!("No empty pipelines, clearing out!");
+        //self.free_pipelines();
+        panic!();
         for pl in self.pipelines.iter_mut().filter(|p| !p.is_empty()) {
             pl.clear();
         }
