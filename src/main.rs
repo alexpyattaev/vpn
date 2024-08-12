@@ -2,8 +2,8 @@ mod crypto;
 mod framing;
 mod keepalive;
 mod util;
-use crypto::{decode_key_base64, make_decryptor, make_encryptor, CryptoMode, Decryptor, Encryptor};
-use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
+use crypto::{make_decryptor, make_encryptor, CryptoMode, Decryptor, Encryptor};
+use framing::{PacketFragmenter, Reassembler, UntrustedMessage};
 mod counters;
 mod selfcheck;
 mod traits;
@@ -16,13 +16,13 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use traits::{ExtranetPacketInterface, IntranetPacketInterface};
-use util::{flatten, merge};
+use util::flatten;
 
 use tokio::time::{Duration, Instant};
 
 // use tun_tap::{Iface, Mode};
 //use tun_tap::r#async::Async;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 use std::sync::Arc;
 
@@ -170,15 +170,8 @@ async fn main() -> Result<()> {
 
     // Key and IV must be references to the `GenericArray` type.
 
-    let chachaparams = {
-        let key = decode_key_base64(&args.key).wrap_err("Could not parse key")?;
-        let nonce = decode_key_base64(&args.nonce).wrap_err("Could not parse nonce")?;
-        crypto::ChaChaParams {
-            key,
-            nonce,
-            mode: args.crypto_mode,
-        }
-    };
+    let chachaparams = crypto::ChaChaParams::new(&args.key, &args.nonce, args.crypto_mode)
+        .wrap_err("Could not parse encryption parameters")?;
 
     let watch_counters = {
         let interval = tokio::time::interval_at(
@@ -189,18 +182,28 @@ async fn main() -> Result<()> {
     };
 
     let encryptor_pool = make_encryptor(chachaparams.clone(), args.encoder_threads);
-    let decryptor_pool = make_decryptor(chachaparams.clone(), args.decoder_threads);
     let encryptor = encryptor_pool.workpool.clone();
+
+    let decryptor_pool = make_decryptor(chachaparams.clone(), args.decoder_threads);
     let decryptor = decryptor_pool.workpool.clone();
+
+    //keep an eye on the thread pools to make sure that if any workers crash we get to know about it ASAP.
+    let threadpool_watch = flatten(tokio::spawn(async {
+        tokio::try_join!(
+            encryptor_pool.watch_threads(),
+            decryptor_pool.watch_threads()
+        )
+    }));
 
     info!("Worker thread setup complete");
 
-    let timeout_ticks = {
+    let timeout_keepalive_thread = {
         let tick = Duration::from_millis(100);
         let timeout = Duration::from_millis(1000);
         let s = encryptor.clone();
         flatten(tokio::spawn(keepalive::keepalive_ticks(tick, timeout, s)))
     };
+
     let udp_reader = flatten(tokio::spawn(read_udp(
         socket.clone(),
         decryptor.clone(),
@@ -219,14 +222,15 @@ async fn main() -> Result<()> {
 
     info!("Init sequence completed, VPN ready");
 
-    //Wait for any thread to quit
+    //Wait for any thread to quit/crash
     tokio::try_join!(
         udp_reader,
         udp_writer,
         tap_reader,
         tap_writer,
         watch_counters,
-        timeout_ticks,
+        timeout_keepalive_thread,
+        threadpool_watch,
     )
     .wrap_err("Fatal error in VPN operation, exiting")?;
 

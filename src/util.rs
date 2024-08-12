@@ -11,6 +11,7 @@ pub async fn flatten<T>(handle: JoinHandle<Result<T>>) -> Result<T> {
     }
 }
 
+#[allow(dead_code)]
 /// merge outputs from a JoinAll into one result, returning the first encountered error.
 pub async fn merge(futs: JoinAll<impl Future<Output = Result<()>>>) -> Result<()> {
     let a = futs.await.into_iter().find(|v| v.is_err());
