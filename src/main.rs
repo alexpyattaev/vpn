@@ -2,7 +2,7 @@ mod crypto;
 mod framing;
 mod keepalive;
 mod util;
-use crypto::{decode_key_base64, CryptoMode, Decryptor, Encryptor, EncryptorPool};
+use crypto::{decode_key_base64, make_decryptor, make_encryptor, CryptoMode, Decryptor, Encryptor};
 use framing::{PacketFragmenter, Reassembler, TrustedMessage, UntrustedMessage};
 mod counters;
 mod selfcheck;
@@ -188,18 +188,10 @@ async fn main() -> Result<()> {
         flatten(tokio::spawn(watch_counters(interval)))
     };
 
-    /*    let (encryptor, encryptors_jh) = {
-            let mut encryptor = Encryptor::new(chachaparams.clone());
-            let encryptors_jh = {
-                let a = (0..args.encoder_threads).map(|_| encryptor.spawn());
-                futures_util::future::join_all(a)
-            };
-            (encryptor, encryptors_jh)
-        };
-    */
-    let encryptor_pool = EncryptorPool::new(chachaparams.clone(), args.encoder_threads);
-    let encryptor = encryptor_pool.encryptor.clone();
-    let decryptor = Decryptor::new(chachaparams.clone(), args.decoder_threads);
+    let encryptor_pool = make_encryptor(chachaparams.clone(), args.encoder_threads);
+    let decryptor_pool = make_decryptor(chachaparams.clone(), args.decoder_threads);
+    let encryptor = encryptor_pool.workpool.clone();
+    let decryptor = decryptor_pool.workpool.clone();
 
     info!("Worker thread setup complete");
 
@@ -211,7 +203,7 @@ async fn main() -> Result<()> {
     };
     let udp_reader = flatten(tokio::spawn(read_udp(
         socket.clone(),
-        decryptor.input.clone(),
+        decryptor.clone(),
         args.udp_mtu,
     )));
 
@@ -223,10 +215,7 @@ async fn main() -> Result<()> {
 
     let tap_reader = flatten(tokio::spawn(read_tap(tun.clone(), encryptor.clone())));
 
-    let tap_writer = flatten(tokio::spawn(feed_tap(
-        decryptor.output.clone(),
-        tun.clone(),
-    )));
+    let tap_writer = flatten(tokio::spawn(feed_tap(decryptor.clone(), tun.clone())));
 
     info!("Init sequence completed, VPN ready");
 
@@ -279,7 +268,7 @@ async fn read_tap(tun: Arc<impl traits::IntranetPacketInterface>, output: Encryp
             );
         }
         for f in pf {
-            output.encrypt(f).await?;
+            output.process(f).await?;
         }
         /*
         // block pipe for needed number of messages (to avoid re-syncing for each)
@@ -323,7 +312,7 @@ async fn feed_udp(
 //#[instrument(skip(output, udp, mtu))]
 async fn read_udp(
     udp: Arc<impl ExtranetPacketInterface>,
-    output: async_channel::Sender<UntrustedMessage>,
+    output: Decryptor,
     mtu: usize,
 ) -> Result<()> {
     loop {
@@ -348,21 +337,18 @@ async fn read_udp(
             }
         };
         COUNTERS.udp_rx.pkt(len);
-        output.send(pkt).await?;
+        output.process(pkt).await?;
     }
 }
 
 //#[instrument(skip(input, tun))]
-async fn feed_tap(
-    input: async_channel::Receiver<TrustedMessage>,
-    tun: Arc<impl IntranetPacketInterface>,
-) -> Result<()> {
+async fn feed_tap(input: Decryptor, tun: Arc<impl IntranetPacketInterface>) -> Result<()> {
     // time to wait in ticks for reordered packets.
     let max_lookback_ticks = 2;
     let mut assembler = Reassembler::<32>::new(1);
     loop {
         let pkt = input
-            .recv()
+            .get_ready_pkt()
             .await
             .wrap_err("No more data for TAP availabe")?;
 

@@ -54,7 +54,7 @@ pub async fn keepalive_ticks(
                 body: BytesMut::new(),
             };
 
-            sender.encrypt(msg).await?;
+            sender.process(msg).await?;
         }
 
         let since_last_rx = cur_time - LAST_RX_PACKET_TIME.load(Ordering::SeqCst);

@@ -43,37 +43,69 @@ pub struct ChaChaParams {
     pub mode: CryptoMode,
 }
 
-struct EncWorkerChannels {
-    input_tx: Sender<TrustedMessage>,
-    output_rx: Receiver<Bytes>,
+//#[derive(Clone)]
+struct WorkerChannels<I, O> {
+    input_tx: Sender<I>,
+    output_rx: Receiver<O>,
+}
+impl<I, O> Clone for WorkerChannels<I, O> {
+    fn clone(&self) -> Self {
+        WorkerChannels {
+            input_tx: self.input_tx.clone(),
+            output_rx: self.output_rx.clone(),
+        }
+    }
 }
 
-struct DecWorkerChannels {
-    input_tx: Sender<UntrustedMessage>,
-    output_rx: Receiver<TrustedMessage>,
+pub fn make_encryptor(
+    params: ChaChaParams,
+    num_threads: NonZeroUsize,
+) -> ThreadWorkPool<TrustedMessage, Bytes> {
+    ThreadWorkPool::new(params, num_threads, work_encrypt)
 }
 
-struct EncryptorInner {
-    worker_channels: Vec<EncWorkerChannels>,
+pub fn make_decryptor(
+    params: ChaChaParams,
+    num_threads: NonZeroUsize,
+) -> ThreadWorkPool<UntrustedMessage, TrustedMessage> {
+    ThreadWorkPool::new(params, num_threads, work_decrypt)
+}
+
+struct PoolInner<T: Clone> {
+    worker_channels: Vec<T>,
     chan_in_idx: AtomicUsize,
     chan_out_idx: AtomicUsize,
 }
 
-#[derive(Clone)]
-pub struct Encryptor {
-    inner: Arc<EncryptorInner>,
+//#[derive(Clone)]
+pub struct WorkPool<I: Send, O: Send> {
+    inner: Arc<PoolInner<WorkerChannels<I, O>>>,
+}
+impl<I: Send, O: Send> Clone for WorkPool<I, O> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
-impl Encryptor {
-    pub async fn encrypt(&self, msg: TrustedMessage) -> Result<()> {
+pub type Encryptor = WorkPool<TrustedMessage, Bytes>;
+pub type Decryptor = WorkPool<UntrustedMessage, TrustedMessage>;
+
+impl<I: Send, O: Send> WorkPool<I, O> {
+    pub async fn process(&self, msg: I) -> Result<()> {
         let c = self.inner.chan_in_idx.fetch_add(1, Ordering::SeqCst);
         let c = c % self.inner.worker_channels.len();
         //println!("Sending pkt to thread {c}");
-        self.inner.worker_channels[c].input_tx.send(msg).await?;
+        self.inner.worker_channels[c]
+            .input_tx
+            .send(msg)
+            .await
+            .map_err(|e| eyre!("Could not send msg"))?;
         Ok(())
     }
 
-    pub async fn get_ready_pkt(&self) -> Result<Bytes> {
+    pub async fn get_ready_pkt(&self) -> Result<O> {
         let c = self.inner.chan_out_idx.fetch_add(1, Ordering::SeqCst);
         let c = c % self.inner.worker_channels.len();
         //println!("Fetching pkt from thread {c}");
@@ -81,51 +113,74 @@ impl Encryptor {
     }
 }
 
-pub struct EncryptorPool {
-    pub encryptor: Encryptor,
+pub struct ThreadWorkPool<I: Send, O: Send> {
+    pub workpool: WorkPool<I, O>,
     workers: Vec<std::thread::JoinHandle<Result<()>>>,
 }
 
-impl Drop for EncryptorPool {
+impl<I: Send, O: Send> Drop for ThreadWorkPool<I, O> {
     fn drop(&mut self) {
-        for wc in self.encryptor.inner.worker_channels.iter() {
+        for wc in self.workpool.inner.worker_channels.iter() {
             wc.input_tx.close();
             wc.output_rx.close();
         }
 
         for w in self.workers.drain(..) {
-            let r = w
-                .join()
-                .expect("Encryptor thread panicked please report bug");
+            let r = w.join().expect("Worker thread panicked please report bug");
             if let Err(m) = r {
                 tracing::error!("Thread crashed with error {m}");
             }
         }
     }
 }
+/*use paste::paste;
+macro_rules! CryptoPool {
+    ($name:ident, $work_fn:ident) => {
+        paste! {
+        struct [< $name Pool >]{
+            pub [< $name:lower >] : Encryptor,
+            workers: Vec<std::thread::JoinHandle<Result<()>>>,
+        }
+        }
+    };
+    }
+fn work() {}
+CryptoPool!(FuckCryptor, work);
+fn bla() {
+    let x: FuckCryptorPool;
+    x.fuckcryptor;
+    }*/
 
 //TODO: deal with thread limits gracefully
-impl EncryptorPool {
-    pub fn new(params: ChaChaParams, num_threads: NonZeroUsize) -> Self {
+impl<I: Send + 'static, O: Send + 'static> ThreadWorkPool<I, O> {
+    pub fn new<W>(params: ChaChaParams, num_threads: NonZeroUsize, work_fn: W) -> Self
+    where
+        W: Clone + Send + Sync + Fn(ChaChaParams, Receiver<I>, Sender<O>) -> Result<()> + 'static,
+    {
         let mut worker_channels = Vec::with_capacity(num_threads.get());
         let mut workers = Vec::with_capacity(num_threads.get());
         for _ in 0..num_threads.get() {
             let input_chan = bounded(1);
             let output_chan = bounded(1);
-            let wc = EncWorkerChannels {
+            let wc = WorkerChannels {
                 input_tx: input_chan.0,
                 output_rx: output_chan.1,
             };
             worker_channels.push(wc);
-            let p = params.clone();
-            let jh = std::thread::spawn(|| Self::work(p, input_chan.1, output_chan.0));
-            workers.push(jh);
+            {
+                let p = params.clone();
+                let i = input_chan.1.clone();
+                let o = output_chan.0.clone();
+                let w = work_fn.clone();
+                let jh = std::thread::spawn(move || w(p, i, o));
+                workers.push(jh);
+            }
         }
 
         Self {
             workers,
-            encryptor: Encryptor {
-                inner: Arc::new(EncryptorInner {
+            workpool: WorkPool {
+                inner: Arc::new(PoolInner {
                     chan_in_idx: AtomicUsize::new(0),
                     chan_out_idx: AtomicUsize::new(0),
                     worker_channels,
@@ -143,7 +198,7 @@ impl EncryptorPool {
                 }
             }
         }
-        for wc in self.encryptor.inner.worker_channels.iter() {
+        for wc in self.workpool.inner.worker_channels.iter() {
             wc.input_tx.close();
             wc.output_rx.close();
         }
@@ -161,132 +216,8 @@ impl EncryptorPool {
         }
         Ok(())
     }
-
-    fn work(
-        params: ChaChaParams,
-        input: async_channel::Receiver<TrustedMessage>,
-        output: async_channel::Sender<Bytes>,
-    ) -> Result<()> {
-        let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-
-        let enc = match params.mode {
-            CryptoMode::Encrypt => apply_keystream_full,
-            CryptoMode::Sign => apply_keystream_partial::<32>,
-        };
-
-        loop {
-            let msg = match input.recv_blocking() {
-                Err(_) => {
-                    tracing::debug!("No more data fo encryptor to receive, exiting thread");
-                    break;
-                }
-                Ok(msg) => msg,
-            };
-
-            cipher.seek(msg.outer_header.seq);
-
-            //dbg!("Encrypting buffer with {} bytes", b.len());
-            let buf = BytesMut::zeroed(msg.buffer_len());
-            let buf = msg
-                .serialize(buf, |b| enc(b, &mut cipher))
-                .wrap_err("Serialization should never fail")?;
-
-            output
-                .send_blocking(buf)
-                .wrap_err("Encryptor thread could not send frame into channel")?;
-        }
-        Ok(())
-    }
 }
 
-fn apply_keystream_full(b: &mut [u8], c: &mut ChaCha20) {
-    c.apply_keystream(b);
-}
-
-fn apply_keystream_partial<const N: usize>(b: &mut [u8], c: &mut ChaCha20) {
-    let l = b.len().min(N);
-    c.apply_keystream(&mut b[..l]);
-}
-
-pub struct Decryptor {
-    pub input: Sender<UntrustedMessage>,
-    pub output: Receiver<TrustedMessage>,
-    pub worker_input: Receiver<UntrustedMessage>,
-    pub worker_output: Sender<TrustedMessage>,
-    workers: Vec<std::thread::JoinHandle<Result<()>>>,
-}
-impl Drop for Decryptor {
-    fn drop(&mut self) {
-        for w in self.workers.drain(..) {
-            let r = w
-                .join()
-                .expect("Decryptor thread panicked please report bug");
-            if let Err(m) = r {
-                tracing::error!("Thread crashed with error {m}");
-            }
-        }
-    }
-}
-
-impl Decryptor {
-    pub fn new(params: ChaChaParams, num_threads: NonZeroUsize) -> Self {
-        let input_chan = bounded(num_threads.get());
-        let output_chan = bounded(num_threads.get());
-        let mut s = Self {
-            input: input_chan.0,
-            output: output_chan.1,
-            worker_input: input_chan.1,
-            worker_output: output_chan.0,
-            workers: Vec::new(),
-        };
-        for _ in 0..num_threads.get() {
-            let i = s.worker_input.clone();
-            let o = s.worker_output.clone();
-            let p = params.clone();
-            let jh = std::thread::spawn(|| Self::work(p, i, o));
-            s.workers.push(jh);
-        }
-        s
-    }
-
-    fn work(
-        params: ChaChaParams,
-        input: Receiver<UntrustedMessage>,
-        output: Sender<TrustedMessage>,
-    ) -> Result<()> {
-        let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
-        let dec = match params.mode {
-            CryptoMode::Encrypt => apply_keystream_full,
-            CryptoMode::Sign => apply_keystream_partial::<32>,
-        };
-        loop {
-            let msg = match input.recv_blocking() {
-                Err(_) => {
-                    tracing::debug!("No more packets for decryptor to consume, exiting");
-                    break;
-                }
-                Ok(msg) => msg,
-            };
-            cipher.seek(msg.header.seq);
-
-            let msg = match TrustedMessage::from_untrusted_msg(msg, |b| dec(b, &mut cipher)) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    tracing::error!("Deserialization failed with {e}");
-                    if cfg!(test) {
-                        panic!("Deserialization failed");
-                    }
-                    continue;
-                }
-            };
-
-            output
-                .send_blocking(msg)
-                .wrap_err("Decryptor thread could not send frame to channel")?;
-        }
-        Ok(())
-    }
-}
 #[allow(clippy::all)]
 #[cfg(test)]
 mod tests {
@@ -316,9 +247,9 @@ mod tests {
         dbg!(&test_data);
         let params = make_bogus_params();
 
-        let encpool = EncryptorPool::new(params.clone(), 1);
-        let enc = encpool.encryptor.clone();
-        let dec = Decryptor::new(params.clone(), 1);
+        let encpool = make_encryptor(params.clone(), NonZeroUsize::new(1).unwrap());
+        let enc = encpool.workpool.clone();
+        let decpool = make_decryptor(params.clone(), NonZeroUsize::new(1).unwrap());
 
         /*async_scoped::TokioScope::scope_and_block(|s| {
         s.spawn(async {
@@ -344,4 +275,87 @@ mod tests {
         });
         });*/
     }
+}
+
+fn work_encrypt(
+    params: ChaChaParams,
+    input: async_channel::Receiver<TrustedMessage>,
+    output: async_channel::Sender<Bytes>,
+) -> Result<()> {
+    let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
+
+    let enc = match params.mode {
+        CryptoMode::Encrypt => apply_keystream_full,
+        CryptoMode::Sign => apply_keystream_partial::<32>,
+    };
+
+    loop {
+        let msg = match input.recv_blocking() {
+            Err(_) => {
+                tracing::debug!("No more data fo encryptor to receive, exiting thread");
+                break;
+            }
+            Ok(msg) => msg,
+        };
+
+        cipher.seek(msg.outer_header.seq);
+
+        //dbg!("Encrypting buffer with {} bytes", b.len());
+        let buf = BytesMut::zeroed(msg.buffer_len());
+        let buf = msg
+            .serialize(buf, |b| enc(b, &mut cipher))
+            .wrap_err("Serialization should never fail")?;
+
+        output
+            .send_blocking(buf)
+            .wrap_err("Encryptor thread could not send frame into channel")?;
+    }
+    Ok(())
+}
+
+fn work_decrypt(
+    params: ChaChaParams,
+    input: Receiver<UntrustedMessage>,
+    output: Sender<TrustedMessage>,
+) -> Result<()> {
+    let mut cipher = ChaCha20::new(params.key.as_ref().into(), &params.nonce.into());
+    let dec = match params.mode {
+        CryptoMode::Encrypt => apply_keystream_full,
+        CryptoMode::Sign => apply_keystream_partial::<32>,
+    };
+    loop {
+        let msg = match input.recv_blocking() {
+            Err(_) => {
+                tracing::debug!("No more packets for decryptor to consume, exiting");
+                break;
+            }
+            Ok(msg) => msg,
+        };
+        cipher.seek(msg.header.seq);
+
+        let msg = match TrustedMessage::from_untrusted_msg(msg, |b| dec(b, &mut cipher)) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::error!("Deserialization failed with {e}");
+                if cfg!(test) {
+                    panic!("Deserialization failed");
+                }
+                continue;
+            }
+        };
+
+        output
+            .send_blocking(msg)
+            .wrap_err("Decryptor thread could not send frame to channel")?;
+    }
+    Ok(())
+}
+
+fn apply_keystream_full(b: &mut [u8], c: &mut ChaCha20) {
+    c.apply_keystream(b);
+}
+
+fn apply_keystream_partial<const N: usize>(b: &mut [u8], c: &mut ChaCha20) {
+    let l = b.len().min(N);
+    c.apply_keystream(&mut b[..l]);
 }
